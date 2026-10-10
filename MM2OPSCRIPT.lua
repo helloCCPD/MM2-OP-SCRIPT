@@ -165,7 +165,11 @@ local function SafeTeleport(targetCFrame)
     end
     
     local success = pcall(function()
-        hrp.CFrame = targetCFrame + Vector3.new(0, 3, 0)
+        local dest = targetCFrame + Vector3.new(0, 3, 0)
+        hrp.CFrame = dest
+        if InvisibilityEnabled then
+            InvisLastMapCFrame = dest
+        end
     end)
     
     return success
@@ -175,12 +179,13 @@ end
 local InvisibleConnection = nil
 local InvisibleRenderLoop = nil
 local InvisOutlineModel = nil
-local InvisCameraAnchor = nil
 local InvisSavedParts = {}
 local InvisSavedJoints = {}
 local InvisSavedDecals = {}
 local InvisRootJoints = {}
-local InvisFarCFrame = CFrame.new(100000, 50000, 100000)
+local InvisSavedRootPriority = 0
+local InvisSavedHipHeight = nil
+local InvisLastMapCFrame = nil
 
 local function MaintainCharacterCollision()
     if NoclipEnabled then return end
@@ -209,7 +214,6 @@ local function CleanupInvisOutline()
         InvisOutlineModel:Destroy()
         InvisOutlineModel = nil
     end
-    InvisCameraAnchor = nil
 end
 
 local function BuildAvatarOutline(char, hrp)
@@ -218,18 +222,6 @@ local function BuildAvatarOutline(char, hrp)
     local outlineModel = Instance.new("Model")
     outlineModel.Name = "MM2_AvatarOutline"
     outlineModel.Parent = Workspace
-
-    local camAnchor = Instance.new("Part")
-    camAnchor.Name = "CameraAnchor"
-    camAnchor.Size = Vector3.new(1, 1, 1)
-    camAnchor.Transparency = 1
-    camAnchor.Anchored = true
-    camAnchor.CanCollide = false
-    camAnchor.CanTouch = false
-    camAnchor.CanQuery = false
-    camAnchor.Massless = true
-    camAnchor.CFrame = hrp.CFrame * CFrame.new(0, 1.5, 0)
-    camAnchor.Parent = outlineModel
 
     local highlight = Instance.new("Highlight")
     highlight.Name = "AvatarOutlineHighlight"
@@ -251,6 +243,7 @@ local function BuildAvatarOutline(char, hrp)
             proxy.CanCollide = false
             proxy.CanTouch = false
             proxy.CanQuery = false
+            proxy.CastShadow = false
             proxy.Massless = true
             proxy.Material = Enum.Material.SmoothPlastic
             proxy.Color = Color3.fromRGB(0, 255, 255)
@@ -261,7 +254,9 @@ local function BuildAvatarOutline(char, hrp)
                 local specialMesh = Instance.new("SpecialMesh")
                 specialMesh.MeshType = Enum.MeshType.FileMesh
                 specialMesh.MeshId = part.MeshId
-                specialMesh.Scale = part.Size / part.MeshSize
+                if part.MeshSize.Magnitude > 0 then
+                    specialMesh.Scale = part.Size / part.MeshSize
+                end
                 specialMesh.Parent = proxy
             else
                 local existingMesh = part:FindFirstChildOfClass("SpecialMesh")
@@ -284,7 +279,6 @@ local function BuildAvatarOutline(char, hrp)
     end
 
     InvisOutlineModel = outlineModel
-    InvisCameraAnchor = camAnchor
 end
 
 local function EnableInvisibility()
@@ -298,6 +292,19 @@ local function EnableInvisibility()
     InvisSavedJoints = {}
     InvisSavedDecals = {}
     InvisRootJoints = {}
+
+    local startMapCFrame = hrp.CFrame
+    InvisLastMapCFrame = startMapCFrame
+    InvisSavedRootPriority = hrp.RootPriority
+    InvisSavedHipHeight = hum.HipHeight
+
+    -- Force HumanoidRootPart to have highest RootPriority (127) so changing Root joint C0
+    -- moves the body parts away from HumanoidRootPart instead of pulling HumanoidRootPart away
+    hrp.RootPriority = 127
+
+    if hum.RigType == Enum.HumanoidRigType.R6 and hum.HipHeight == 0 then
+        hum.HipHeight = 2
+    end
 
     for _, obj in pairs(char:GetDescendants()) do
         if obj:IsA("Motor6D") or obj:IsA("Weld") then
@@ -313,28 +320,33 @@ local function EnableInvisibility()
             end
         elseif obj:IsA("BasePart") and obj ~= hrp then
             InvisSavedParts[obj] = {
-                RelCF = hrp.CFrame:ToObjectSpace(obj.CFrame),
+                RelCF = startMapCFrame:ToObjectSpace(obj.CFrame),
                 Transparency = obj.Transparency,
                 CanCollide = obj.CanCollide,
                 CanTouch = obj.CanTouch,
-                Massless = obj.Massless
+                Massless = obj.Massless,
+                RootPriority = obj.RootPriority
             }
+            obj.RootPriority = -127
             obj.Massless = true
             obj.CanCollide = false
             obj.CanTouch = true
+            obj.Transparency = 1
         elseif obj:IsA("Decal") or obj:IsA("Texture") then
             InvisSavedDecals[obj] = obj.Transparency
+            obj.Transparency = 1
         end
     end
 
     hrp.CanCollide = true
     hrp.CanTouch = true
+    hrp.CFrame = startMapCFrame
 
     BuildAvatarOutline(char, hrp)
 
-    if not SpectateConnection and InvisCameraAnchor then
+    if not SpectateConnection then
         Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
-        Workspace.CurrentCamera.CameraSubject = InvisCameraAnchor
+        Workspace.CurrentCamera.CameraSubject = hrp
     end
 
     InvisibleRenderLoop = RunService.RenderStepped:Connect(function()
@@ -342,16 +354,27 @@ local function EnableInvisibility()
         local c, hRoot, hHum = GetCharacter()
         if not c or not hRoot or not hHum then return end
 
-        -- Update avatar outline and camera anchor at actual player position in game
-        if not InvisOutlineModel or not InvisOutlineModel.Parent then
-            BuildAvatarOutline(c, hRoot)
+        hRoot.RootPriority = 127
+
+        local mapCF = hRoot.CFrame
+        -- Guard against HumanoidRootPart ever getting pulled toward the far-away body parts
+        if InvisLastMapCFrame and (mapCF.Position.Y > InvisLastMapCFrame.Position.Y + 500 or (mapCF.Position - InvisLastMapCFrame.Position).Magnitude > 1000) then
+            mapCF = InvisLastMapCFrame
+            hRoot.CFrame = mapCF
+            hRoot.Velocity = Vector3.new(0, 0, 0)
+            hRoot.RotVelocity = Vector3.new(0, 0, 0)
+        else
+            InvisLastMapCFrame = mapCF
         end
 
-        if InvisCameraAnchor then
-            InvisCameraAnchor.CFrame = hRoot.CFrame * CFrame.new(0, 1.5, 0)
-            if not SpectateConnection and Workspace.CurrentCamera.CameraSubject ~= InvisCameraAnchor then
-                Workspace.CurrentCamera.CameraSubject = InvisCameraAnchor
-            end
+        -- Keep camera locked to HumanoidRootPart in the map
+        if not SpectateConnection and Workspace.CurrentCamera.CameraSubject ~= hRoot then
+            Workspace.CurrentCamera.CameraSubject = hRoot
+        end
+
+        -- Update avatar outline at the player's real map position
+        if not InvisOutlineModel or not InvisOutlineModel.Parent then
+            BuildAvatarOutline(c, hRoot)
         end
 
         if InvisOutlineModel then
@@ -359,33 +382,37 @@ local function EnableInvisibility()
                 if part and part.Parent then
                     local proxy = InvisOutlineModel:FindFirstChild(part.Name)
                     if proxy and proxy:IsA("BasePart") then
-                        proxy.CFrame = hRoot.CFrame * data.RelCF
+                        proxy.CFrame = mapCF * data.RelCF
                     end
                 end
             end
         end
 
-        -- Move all actual body parts far away from spawn via Root joints & part CFrames
+        -- Move all actual body parts far away from spawn while keeping HumanoidRootPart anchored at mapCF
+        local farCF = CFrame.new(mapCF.Position.X, mapCF.Position.Y + 2500, mapCF.Position.Z)
         for _, joint in ipairs(InvisRootJoints) do
             if joint and joint.Parent then
                 local saved = InvisSavedJoints[joint]
                 if saved then
                     if joint.Part0 == hRoot then
-                        joint.C0 = hRoot.CFrame:ToObjectSpace(InvisFarCFrame) * saved.C1
+                        joint.C0 = mapCF:ToObjectSpace(farCF) * saved.C1
                     elseif joint.Part1 == hRoot then
-                        joint.C1 = hRoot.CFrame:ToObjectSpace(InvisFarCFrame) * saved.C0
+                        joint.C1 = farCF:ToObjectSpace(mapCF) * saved.C0
                     end
                 end
             end
         end
 
-        for part, data in pairs(InvisSavedParts) do
+        -- Immediately lock HumanoidRootPart at mapCF so joint C0 changes never shift it
+        hRoot.CFrame = mapCF
+
+        for part in pairs(InvisSavedParts) do
             if part and part.Parent then
+                part.RootPriority = -127
                 part.Massless = true
+                part.CanCollide = false
                 part.CanTouch = true
-                if #InvisRootJoints == 0 then
-                    part.CFrame = InvisFarCFrame * data.RelCF
-                end
+                part.Transparency = 1
             end
         end
     end)
@@ -394,6 +421,8 @@ local function EnableInvisibility()
         if not InvisibilityEnabled then return end
         local c, hRoot, hHum = GetCharacter()
         if not c or not hRoot or not hHum then return end
+
+        hRoot.RootPriority = 127
 
         -- Immortality protection
         hHum.MaxHealth = 9e9
@@ -438,8 +467,10 @@ local function DisableInvisibility()
 
     local char, hrp, hum = GetCharacter()
     if char and hrp then
+        local restoreCF = InvisLastMapCFrame or hrp.CFrame
         hrp.Velocity = Vector3.new(0, 0, 0)
         hrp.RotVelocity = Vector3.new(0, 0, 0)
+        hrp.CFrame = restoreCF
 
         -- Restore all joints to exact original C0/C1 before snapping parts back
         for joint, data in pairs(InvisSavedJoints) do
@@ -457,11 +488,12 @@ local function DisableInvisibility()
             if part and part.Parent then
                 part.Velocity = Vector3.new(0, 0, 0)
                 part.RotVelocity = Vector3.new(0, 0, 0)
+                part.RootPriority = data.RootPriority
                 part.Massless = data.Massless
                 part.Transparency = data.Transparency
                 part.CanCollide = not NoclipEnabled and data.CanCollide or false
                 part.CanTouch = true
-                part.CFrame = hrp.CFrame * data.RelCF
+                part.CFrame = restoreCF * data.RelCF
             end
         end
 
@@ -471,11 +503,16 @@ local function DisableInvisibility()
             end
         end
 
+        hrp.RootPriority = InvisSavedRootPriority
         hrp.CanCollide = not NoclipEnabled
         hrp.CanTouch = true
+        hrp.CFrame = restoreCF
     end
 
     if hum then
+        if InvisSavedHipHeight ~= nil then
+            hum.HipHeight = InvisSavedHipHeight
+        end
         hum:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
         hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
         hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
@@ -493,6 +530,7 @@ local function DisableInvisibility()
     InvisSavedJoints = {}
     InvisSavedDecals = {}
     InvisRootJoints = {}
+    InvisLastMapCFrame = nil
 end
 
 -- ==================== MAP & LOBBY DETECTION ====================
@@ -910,8 +948,8 @@ local function StopSpectating()
     local char, hrp, hum = GetCharacter()
     if hum then
         Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
-        if InvisibilityEnabled and InvisCameraAnchor then
-            Workspace.CurrentCamera.CameraSubject = InvisCameraAnchor
+        if InvisibilityEnabled and hrp then
+            Workspace.CurrentCamera.CameraSubject = hrp
         else
             Workspace.CurrentCamera.CameraSubject = hum
         end
@@ -1833,6 +1871,7 @@ LocalPlayer.CharacterAdded:Connect(function(char)
     InvisSavedJoints = {}
     InvisSavedDecals = {}
     InvisRootJoints = {}
+    InvisLastMapCFrame = nil
 
     task.wait(0.5)
     local hrp = char:WaitForChild("HumanoidRootPart")
