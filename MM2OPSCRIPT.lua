@@ -454,11 +454,15 @@ local function EnableInvisibility()
         end
 
         -- Rotate character & outline smoothly when Shift-Lock or First-Person is active
-        if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+        if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter and not FlyEnabled then
             local camLook = Workspace.CurrentCamera.CFrame.LookVector
             local flatLook = Vector3.new(camLook.X, 0, camLook.Z)
             if flatLook.Magnitude > 0.001 then
+                local currentVel = hRoot.Velocity
                 mapCF = CFrame.new(mapCF.Position, mapCF.Position + flatLook.Unit)
+                hRoot.CFrame = mapCF
+                hRoot.Velocity = currentVel
+                hRoot.RotVelocity = Vector3.new(0, 0, 0)
             end
         end
 
@@ -491,22 +495,27 @@ local function EnableInvisibility()
             end
         end
 
-        -- Move all actual body parts & holstered weapons far away (+2500 studs up) via Root joints
+        -- Only apply the +2500 stud offset to Root joints if not already applied (prevents per-frame physics solver spiral)
         for _, joint in ipairs(InvisRootJoints) do
             if joint and joint.Parent then
                 local saved = InvisSavedJoints[joint]
                 if saved then
                     if joint.Part0 == hRoot then
-                        joint.C0 = saved.C0 + Vector3.new(0, 2500, 0)
+                        local targetC0 = saved.C0 + Vector3.new(0, 2500, 0)
+                        if (joint.C0.Position - targetC0.Position).Magnitude > 1 then
+                            joint.C0 = targetC0
+                            hRoot.CFrame = mapCF
+                        end
                     elseif joint.Part1 == hRoot then
-                        joint.C1 = saved.C1 + Vector3.new(0, 2500, 0)
+                        local targetC1 = saved.C1 + Vector3.new(0, 2500, 0)
+                        if (joint.C1.Position - targetC1.Position).Magnitude > 1 then
+                            joint.C1 = targetC1
+                            hRoot.CFrame = mapCF
+                        end
                     end
                 end
             end
         end
-
-        -- Keep HumanoidRootPart locked at mapCF in the map
-        hRoot.CFrame = mapCF
 
         for part in pairs(InvisSavedParts) do
             if part and part.Parent then
@@ -526,6 +535,28 @@ local function EnableInvisibility()
         if not c or not hRoot or not hHum then return end
 
         hRoot.RootPriority = 127
+
+        -- Neutralize Animator Transform on Root joints and damp spin/upward drift so the 2500-stud offset never spirals
+        for _, joint in ipairs(InvisRootJoints) do
+            if joint and joint.Parent and joint:IsA("Motor6D") then
+                joint.Transform = CFrame.new()
+            end
+        end
+
+        if not FlyEnabled then
+            hRoot.RotVelocity = Vector3.new(0, 0, 0)
+            local state = hHum:GetState()
+            if not hHum.Jump and state ~= Enum.HumanoidStateType.Jumping and hRoot.Velocity.Y > 0 then
+                hRoot.Velocity = Vector3.new(hRoot.Velocity.X, 0, hRoot.Velocity.Z)
+            end
+        end
+
+        for part in pairs(InvisSavedParts) do
+            if part and part.Parent then
+                part.Velocity = Vector3.new(0, 0, 0)
+                part.RotVelocity = Vector3.new(0, 0, 0)
+            end
+        end
 
         -- Immortality protection
         hHum.MaxHealth = 9e9
