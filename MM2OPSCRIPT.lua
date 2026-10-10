@@ -171,100 +171,259 @@ local function SafeTeleport(targetCFrame)
     return success
 end
 
--- ==================== INVISIBILITY (SERVER-SIDE) ====================
+-- ==================== INVISIBILITY ====================
 local InvisibleConnection = nil
 local InvisibleRenderLoop = nil
+local InvisOutlineModel = nil
+local InvisCameraAnchor = nil
+local InvisSavedParts = {}
+local InvisSavedJoints = {}
+local InvisSavedDecals = {}
+local InvisRootJoints = {}
+local InvisFarCFrame = CFrame.new(100000, 50000, 100000)
 
-local function ApplyTransparency(container, t)
-    if not container then return end
-    for _, obj in pairs(container:GetDescendants()) do
-        if obj:IsA("BasePart") or obj:IsA("Decal") or obj:IsA("Texture") then
-            obj.Transparency = t
-        end
-    end
-end
+local function MaintainCharacterCollision()
+    if NoclipEnabled then return end
+    local char, hrp = GetCharacter()
+    if not char or not hrp then return end
 
-local function SetPlayerTransparency(char, t)
-    if not char then return end
-    for _, obj in pairs(char:GetDescendants()) do
-        if (obj:IsA("BasePart") and obj.Name ~= "HumanoidRootPart") or obj:IsA("Decal") or obj:IsA("Texture") then
-            obj.Transparency = t
-        end
-    end
-    -- weapons in the Backpack (knife on back / gun on waist)
-    ApplyTransparency(LocalPlayer:FindFirstChild("Backpack"), t)
-    -- weapons welded into the character's assembly but parented elsewhere
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if root then
-        for _, part in pairs(root:GetConnectedParts(true)) do
-            if part:IsA("BasePart") and not part:IsDescendantOf(char) then
-                part.Transparency = t
+    hrp.CanCollide = true
+    hrp.CanTouch = true
+
+    for _, part in pairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanTouch = true
+            if not InvisibilityEnabled then
+                if part.Name == "HumanoidRootPart" or part.Name == "Torso" or part.Name == "UpperTorso" or part.Name == "LowerTorso" or part.Name == "Head" then
+                    part.CanCollide = true
+                end
             end
         end
     end
 end
 
--- Force the server to re-replicate the character (the actual server-side trick)
-local function ForceServerReplication()
-    local char = LocalPlayer.Character
-    if not char then return end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-    local pos = hrp.Position
+RunService.Stepped:Connect(MaintainCharacterCollision)
 
-    -- shove the character far away so the server drops/rebuilds its replication
-    char:MoveTo(pos + Vector3.new(0, 1000000, 0))
-    task.wait(0.1)
+local function CleanupInvisOutline()
+    if InvisOutlineModel then
+        InvisOutlineModel:Destroy()
+        InvisOutlineModel = nil
+    end
+    InvisCameraAnchor = nil
+end
 
-    -- destroy + replace the root so the server re-reads the character's state
-    local newRoot = hrp:Clone()
-    hrp:Destroy()
-    newRoot.Parent = char
+local function BuildAvatarOutline(char, hrp)
+    CleanupInvisOutline()
 
-    -- re-link the rig to the new root (keeps the character from falling apart)
-    for _, d in pairs(char:GetDescendants()) do
-        if d:IsA("Motor6D") and (d.Part1 == nil or d.Part1 == hrp) then
-            d.Part1 = newRoot
+    local outlineModel = Instance.new("Model")
+    outlineModel.Name = "MM2_AvatarOutline"
+    outlineModel.Parent = Workspace
+
+    local camAnchor = Instance.new("Part")
+    camAnchor.Name = "CameraAnchor"
+    camAnchor.Size = Vector3.new(1, 1, 1)
+    camAnchor.Transparency = 1
+    camAnchor.Anchored = true
+    camAnchor.CanCollide = false
+    camAnchor.CanTouch = false
+    camAnchor.CanQuery = false
+    camAnchor.Massless = true
+    camAnchor.CFrame = hrp.CFrame * CFrame.new(0, 1.5, 0)
+    camAnchor.Parent = outlineModel
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "AvatarOutlineHighlight"
+    highlight.FillColor = Color3.fromRGB(0, 255, 255)
+    highlight.OutlineColor = Color3.fromRGB(0, 255, 255)
+    highlight.FillTransparency = 1
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Adornee = outlineModel
+    highlight.Parent = outlineModel
+
+    for _, part in pairs(char:GetChildren()) do
+        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+            local proxy = Instance.new("Part")
+            proxy.Name = part.Name
+            proxy.Size = part.Size
+            proxy.CFrame = part.CFrame
+            proxy.Anchored = true
+            proxy.CanCollide = false
+            proxy.CanTouch = false
+            proxy.CanQuery = false
+            proxy.Massless = true
+            proxy.Material = Enum.Material.SmoothPlastic
+            proxy.Color = Color3.fromRGB(0, 255, 255)
+            proxy.Transparency = 0.95
+            proxy.Parent = outlineModel
+
+            if part:IsA("MeshPart") and part.MeshId ~= "" then
+                local specialMesh = Instance.new("SpecialMesh")
+                specialMesh.MeshType = Enum.MeshType.FileMesh
+                specialMesh.MeshId = part.MeshId
+                specialMesh.Scale = part.Size / part.MeshSize
+                specialMesh.Parent = proxy
+            else
+                local existingMesh = part:FindFirstChildOfClass("SpecialMesh")
+                if existingMesh then
+                    local meshClone = existingMesh:Clone()
+                    meshClone.TextureId = ""
+                    meshClone.Parent = proxy
+                end
+            end
+
+            local selectionBox = Instance.new("SelectionBox")
+            selectionBox.Name = "LimbOutline"
+            selectionBox.Adornee = proxy
+            selectionBox.Color3 = Color3.fromRGB(0, 255, 255)
+            selectionBox.LineThickness = 0.02
+            selectionBox.SurfaceTransparency = 1
+            selectionBox.Transparency = 0
+            selectionBox.Parent = proxy
         end
     end
 
-    char:MoveTo(pos)
-    task.wait(0.1)
+    InvisOutlineModel = outlineModel
+    InvisCameraAnchor = camAnchor
 end
 
 local function EnableInvisibility()
-    if not LocalPlayer.Character then return end
+    local char, hrp, hum = GetCharacter()
+    if not char or not hrp or not hum then return end
 
-    -- 1) force the server to re-replicate the character
-    ForceServerReplication()
+    if InvisibleConnection then InvisibleConnection:Disconnect() InvisibleConnection = nil end
+    if InvisibleRenderLoop then InvisibleRenderLoop:Disconnect() InvisibleRenderLoop = nil end
 
-    -- 2) hide locally (this now carries to the server)
-    SetPlayerTransparency(LocalPlayer.Character, 1)
+    InvisSavedParts = {}
+    InvisSavedJoints = {}
+    InvisSavedDecals = {}
+    InvisRootJoints = {}
 
-    if InvisibleConnection then InvisibleConnection:Disconnect() end
-    if InvisibleRenderLoop then InvisibleRenderLoop:Disconnect() end
+    for _, obj in pairs(char:GetDescendants()) do
+        if obj:IsA("Motor6D") or obj:IsA("Weld") then
+            InvisSavedJoints[obj] = {
+                C0 = obj.C0,
+                C1 = obj.C1,
+                Part0 = obj.Part0,
+                Part1 = obj.Part1,
+                Enabled = obj.Enabled
+            }
+            if obj.Part0 == hrp or obj.Part1 == hrp then
+                table.insert(InvisRootJoints, obj)
+            end
+        elseif obj:IsA("BasePart") and obj ~= hrp then
+            InvisSavedParts[obj] = {
+                RelCF = hrp.CFrame:ToObjectSpace(obj.CFrame),
+                Transparency = obj.Transparency,
+                CanCollide = obj.CanCollide,
+                CanTouch = obj.CanTouch,
+                Massless = obj.Massless
+            }
+            obj.Massless = true
+            obj.CanCollide = false
+            obj.CanTouch = true
+        elseif obj:IsA("Decal") or obj:IsA("Texture") then
+            InvisSavedDecals[obj] = obj.Transparency
+        end
+    end
 
-    InvisibleRenderLoop = RunService.Heartbeat:Connect(function()
+    hrp.CanCollide = true
+    hrp.CanTouch = true
+
+    BuildAvatarOutline(char, hrp)
+
+    if not SpectateConnection and InvisCameraAnchor then
+        Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+        Workspace.CurrentCamera.CameraSubject = InvisCameraAnchor
+    end
+
+    InvisibleRenderLoop = RunService.RenderStepped:Connect(function()
         if not InvisibilityEnabled then return end
-        local c = LocalPlayer.Character
-        if c then
-            SetPlayerTransparency(c, 1)
+        local c, hRoot, hHum = GetCharacter()
+        if not c or not hRoot or not hHum then return end
+
+        -- Update avatar outline and camera anchor at actual player position in game
+        if not InvisOutlineModel or not InvisOutlineModel.Parent then
+            BuildAvatarOutline(c, hRoot)
+        end
+
+        if InvisCameraAnchor then
+            InvisCameraAnchor.CFrame = hRoot.CFrame * CFrame.new(0, 1.5, 0)
+            if not SpectateConnection and Workspace.CurrentCamera.CameraSubject ~= InvisCameraAnchor then
+                Workspace.CurrentCamera.CameraSubject = InvisCameraAnchor
+            end
+        end
+
+        if InvisOutlineModel then
+            for part, data in pairs(InvisSavedParts) do
+                if part and part.Parent then
+                    local proxy = InvisOutlineModel:FindFirstChild(part.Name)
+                    if proxy and proxy:IsA("BasePart") then
+                        proxy.CFrame = hRoot.CFrame * data.RelCF
+                    end
+                end
+            end
+        end
+
+        -- Move all actual body parts far away from spawn via Root joints & part CFrames
+        for _, joint in ipairs(InvisRootJoints) do
+            if joint and joint.Parent then
+                local saved = InvisSavedJoints[joint]
+                if saved then
+                    if joint.Part0 == hRoot then
+                        joint.C0 = hRoot.CFrame:ToObjectSpace(InvisFarCFrame) * saved.C1
+                    elseif joint.Part1 == hRoot then
+                        joint.C1 = hRoot.CFrame:ToObjectSpace(InvisFarCFrame) * saved.C0
+                    end
+                end
+            end
+        end
+
+        for part, data in pairs(InvisSavedParts) do
+            if part and part.Parent then
+                part.Massless = true
+                part.CanTouch = true
+                if #InvisRootJoints == 0 then
+                    part.CFrame = InvisFarCFrame * data.RelCF
+                end
+            end
         end
     end)
-    
+
     InvisibleConnection = RunService.Stepped:Connect(function()
         if not InvisibilityEnabled then return end
         local c, hRoot, hHum = GetCharacter()
-        if hHum then
-            hHum.MaxHealth = 9e9
-            hHum.Health = 9e9
-            hHum:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
-            hHum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        if not c or not hRoot or not hHum then return end
+
+        -- Immortality protection
+        hHum.MaxHealth = 9e9
+        hHum.Health = 9e9
+        hHum:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+        hHum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        hHum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+
+        -- Always keep collision and touch enabled so player can pick up dropped gun while invisible
+        if not NoclipEnabled then
+            hRoot.CanCollide = true
         end
-        if c then
-            for _, part in pairs(c:GetChildren()) do
-                if part:IsA("BasePart") then
-                    part.CanTouch = false
+        hRoot.CanTouch = true
+
+        for _, part in pairs(c:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanTouch = true
+            end
+        end
+
+        -- Ensure walking over dropped gun picks it up immediately while invisible
+        for _, obj in pairs(Workspace:GetDescendants()) do
+            if obj:IsA("BasePart") and (obj.Name == "GunDrop" or obj.Name == "DroppedGun" or obj.Name == "Gun") then
+                if (hRoot.Position - obj.Position).Magnitude <= 6.5 then
+                    if typeof(firetouchinterest) == "function" then
+                        pcall(function()
+                            firetouchinterest(hRoot, obj, 0)
+                            firetouchinterest(hRoot, obj, 1)
+                        end)
+                    end
                 end
             end
         end
@@ -275,20 +434,65 @@ local function DisableInvisibility()
     if InvisibleConnection then InvisibleConnection:Disconnect() InvisibleConnection = nil end
     if InvisibleRenderLoop then InvisibleRenderLoop:Disconnect() InvisibleRenderLoop = nil end
 
+    CleanupInvisOutline()
+
     local char, hrp, hum = GetCharacter()
-    if char then
-        SetPlayerTransparency(char, 0)
+    if char and hrp then
+        hrp.Velocity = Vector3.new(0, 0, 0)
+        hrp.RotVelocity = Vector3.new(0, 0, 0)
+
+        -- Restore all joints to exact original C0/C1 before snapping parts back
+        for joint, data in pairs(InvisSavedJoints) do
+            if joint and joint.Parent then
+                joint.Part0 = data.Part0
+                joint.Part1 = data.Part1
+                joint.C0 = data.C0
+                joint.C1 = data.C1
+                joint.Enabled = data.Enabled
+            end
+        end
+
+        -- Snap all body parts cleanly back to their exact relative position on HumanoidRootPart
+        for part, data in pairs(InvisSavedParts) do
+            if part and part.Parent then
+                part.Velocity = Vector3.new(0, 0, 0)
+                part.RotVelocity = Vector3.new(0, 0, 0)
+                part.Massless = data.Massless
+                part.Transparency = data.Transparency
+                part.CanCollide = not NoclipEnabled and data.CanCollide or false
+                part.CanTouch = true
+                part.CFrame = hrp.CFrame * data.RelCF
+            end
+        end
+
+        for decal, trans in pairs(InvisSavedDecals) do
+            if decal and decal.Parent then
+                decal.Transparency = trans
+            end
+        end
+
+        hrp.CanCollide = not NoclipEnabled
+        hrp.CanTouch = true
     end
 
-    -- refresh so the "visible again" state also replicates
-    ForceServerReplication()
-
-    hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid")
     if hum then
         hum:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
         hum.MaxHealth = 100
         hum.Health = 100
+        hum:ChangeState(Enum.HumanoidStateType.Running)
+
+        if not SpectateConnection then
+            Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+            Workspace.CurrentCamera.CameraSubject = hum
+        end
     end
+
+    InvisSavedParts = {}
+    InvisSavedJoints = {}
+    InvisSavedDecals = {}
+    InvisRootJoints = {}
 end
 
 -- ==================== MAP & LOBBY DETECTION ====================
@@ -706,7 +910,11 @@ local function StopSpectating()
     local char, hrp, hum = GetCharacter()
     if hum then
         Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
-        Workspace.CurrentCamera.CameraSubject = hum
+        if InvisibilityEnabled and InvisCameraAnchor then
+            Workspace.CurrentCamera.CameraSubject = InvisCameraAnchor
+        else
+            Workspace.CurrentCamera.CameraSubject = hum
+        end
         Rayfield:Notify({ Title = "Spectate Stopped", Content = "Camera reset to local character.", Duration = 3, Image = "check" })
     end
 end
@@ -854,6 +1062,7 @@ local XRayHighlights = {}
 
 local function XRayIsCharacterPart(part)
     local model = part:FindFirstAncestorOfClass("Model")
+    if model and model.Name == "MM2_AvatarOutline" then return true end
     return model ~= nil and Players:GetPlayerFromCharacter(model) ~= nil
 end
 
@@ -1076,9 +1285,10 @@ MainTab:CreateToggle({
         InvisibilityEnabled = Value
         if Value then
             EnableInvisibility()
-            Rayfield:Notify({ Title = "Invisibility", Content = "Invisibility Active!", Duration = 3, Image = "eye-off" })
+            Rayfield:Notify({ Title = "Invisibility", Content = "Body parts moved far away! Avatar outline & immortality active.", Duration = 3, Image = "eye-off" })
         else
             DisableInvisibility()
+            Rayfield:Notify({ Title = "Invisibility", Content = "Body parts restored to normal position!", Duration = 3, Image = "eye" })
         end
     end,
 })
@@ -1618,6 +1828,12 @@ MiscTab:CreateButton({
 
 -- Character handler
 LocalPlayer.CharacterAdded:Connect(function(char)
+    CleanupInvisOutline()
+    InvisSavedParts = {}
+    InvisSavedJoints = {}
+    InvisSavedDecals = {}
+    InvisRootJoints = {}
+
     task.wait(0.5)
     local hrp = char:WaitForChild("HumanoidRootPart")
     local hum = char:WaitForChild("Humanoid")
