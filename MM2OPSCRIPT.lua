@@ -171,9 +171,10 @@ local function SafeTeleport(targetCFrame)
     return success
 end
 
--- ==================== INVISIBILITY ====================
+-- ==================== INVISIBILITY (SERVER-SIDE) ====================
 local InvisibleConnection = nil
 local InvisibleRenderLoop = nil
+local InvisForcePart = nil
 
 local function HideCharacterAndAccessories(char)
     for _, obj in pairs(char:GetDescendants()) do
@@ -183,11 +184,40 @@ local function HideCharacterAndAccessories(char)
     end
 end
 
+-- Force the server to re-replicate the character so invisibility is server-wide
+local function ForceReplicateInvisibility(char)
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    if InvisForcePart and InvisForcePart.Parent then
+        InvisForcePart:Destroy()
+    end
+
+    local part = Instance.new("Part")
+    part.Name = "MM2_InvisForce"
+    part.Size = Vector3.new(1, 1, 1)
+    part.Transparency = 1
+    part.CanCollide = false
+    part.CanTouch = false
+    part.CanQuery = false
+    part.Anchored = false
+    part.CFrame = hrp.CFrame
+    part.Parent = Workspace
+
+    local weld = Instance.new("Weld")
+    weld.Part0 = part
+    weld.Part1 = hrp
+    weld.Parent = part
+
+    InvisForcePart = part
+end
+
 local function EnableInvisibility()
     local char, hrp = GetCharacter()
     if not char or not hrp then return end
     
     HideCharacterAndAccessories(char)
+    ForceReplicateInvisibility(char)
     
     if InvisibleConnection then InvisibleConnection:Disconnect() end
     if InvisibleRenderLoop then InvisibleRenderLoop:Disconnect() end
@@ -222,6 +252,7 @@ end
 local function DisableInvisibility()
     if InvisibleConnection then InvisibleConnection:Disconnect() InvisibleConnection = nil end
     if InvisibleRenderLoop then InvisibleRenderLoop:Disconnect() InvisibleRenderLoop = nil end
+    if InvisForcePart then InvisForcePart:Destroy() InvisForcePart = nil end
     
     local char, hrp, hum = GetCharacter()
     if char then
