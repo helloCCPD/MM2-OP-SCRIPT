@@ -174,51 +174,73 @@ end
 -- ==================== INVISIBILITY (SERVER-SIDE) ====================
 local InvisibleConnection = nil
 local InvisibleRenderLoop = nil
-local InvisForcePart = nil
 
-local function HideCharacterAndAccessories(char)
-    for _, obj in pairs(char:GetDescendants()) do
+local function ApplyTransparency(container, t)
+    if not container then return end
+    for _, obj in pairs(container:GetDescendants()) do
         if obj:IsA("BasePart") or obj:IsA("Decal") or obj:IsA("Texture") then
-            obj.Transparency = 1
+            obj.Transparency = t
         end
     end
 end
 
--- Force the server to re-replicate the character so invisibility is server-wide
-local function ForceReplicateInvisibility(char)
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
+local function SetPlayerTransparency(char, t)
+    if not char then return end
+    for _, obj in pairs(char:GetDescendants()) do
+        if (obj:IsA("BasePart") and obj.Name ~= "HumanoidRootPart") or obj:IsA("Decal") or obj:IsA("Texture") then
+            obj.Transparency = t
+        end
+    end
+    -- weapons in the Backpack (knife on back / gun on waist)
+    ApplyTransparency(LocalPlayer:FindFirstChild("Backpack"), t)
+    -- weapons welded into the character's assembly but parented elsewhere
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if root then
+        for _, part in pairs(root:GetConnectedParts(true)) do
+            if part:IsA("BasePart") and not part:IsDescendantOf(char) then
+                part.Transparency = t
+            end
+        end
+    end
+end
 
-    if InvisForcePart and InvisForcePart.Parent then
-        InvisForcePart:Destroy()
+-- Force the server to re-replicate the character (the actual server-side trick)
+local function ForceServerReplication()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local pos = hrp.Position
+
+    -- shove the character far away so the server drops/rebuilds its replication
+    char:MoveTo(pos + Vector3.new(0, 1000000, 0))
+    task.wait(0.1)
+
+    -- destroy + replace the root so the server re-reads the character's state
+    local newRoot = hrp:Clone()
+    hrp:Destroy()
+    newRoot.Parent = char
+
+    -- re-link the rig to the new root (keeps the character from falling apart)
+    for _, d in pairs(char:GetDescendants()) do
+        if d:IsA("Motor6D") and (d.Part1 == nil or d.Part1 == hrp) then
+            d.Part1 = newRoot
+        end
     end
 
-    local part = Instance.new("Part")
-    part.Name = "MM2_InvisForce"
-    part.Size = Vector3.new(1, 1, 1)
-    part.Transparency = 1
-    part.CanCollide = false
-    part.CanTouch = false
-    part.CanQuery = false
-    part.Anchored = false
-    part.CFrame = hrp.CFrame
-    part.Parent = Workspace
-
-    local weld = Instance.new("Weld")
-    weld.Part0 = part
-    weld.Part1 = hrp
-    weld.Parent = part
-
-    InvisForcePart = part
+    char:MoveTo(pos)
+    task.wait(0.1)
 end
 
 local function EnableInvisibility()
-    local char, hrp = GetCharacter()
-    if not char or not hrp then return end
-    
-    HideCharacterAndAccessories(char)
-    ForceReplicateInvisibility(char)
-    
+    if not LocalPlayer.Character then return end
+
+    -- 1) force the server to re-replicate the character
+    ForceServerReplication()
+
+    -- 2) hide locally (this now carries to the server)
+    SetPlayerTransparency(LocalPlayer.Character, 1)
+
     if InvisibleConnection then InvisibleConnection:Disconnect() end
     if InvisibleRenderLoop then InvisibleRenderLoop:Disconnect() end
 
@@ -226,7 +248,7 @@ local function EnableInvisibility()
         if not InvisibilityEnabled then return end
         local c = LocalPlayer.Character
         if c then
-            HideCharacterAndAccessories(c)
+            SetPlayerTransparency(c, 1)
         end
     end)
     
@@ -252,16 +274,16 @@ end
 local function DisableInvisibility()
     if InvisibleConnection then InvisibleConnection:Disconnect() InvisibleConnection = nil end
     if InvisibleRenderLoop then InvisibleRenderLoop:Disconnect() InvisibleRenderLoop = nil end
-    if InvisForcePart then InvisForcePart:Destroy() InvisForcePart = nil end
-    
+
     local char, hrp, hum = GetCharacter()
     if char then
-        for _, obj in pairs(char:GetDescendants()) do
-            if (obj:IsA("BasePart") and obj.Name ~= "HumanoidRootPart") or obj:IsA("Decal") or obj:IsA("Texture") then
-                obj.Transparency = 0
-            end
-        end
+        SetPlayerTransparency(char, 0)
     end
+
+    -- refresh so the "visible again" state also replicates
+    ForceServerReplication()
+
+    hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid")
     if hum then
         hum:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
         hum.MaxHealth = 100
