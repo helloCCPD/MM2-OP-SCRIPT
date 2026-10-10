@@ -179,6 +179,8 @@ end
 local InvisibleConnection = nil
 local InvisibleRenderLoop = nil
 local InvisOutlineModel = nil
+local InvisOutlineHumanoid = nil
+local InvisOutlineHRP = nil
 local InvisSavedParts = {}
 local InvisSavedJoints = {}
 local InvisSavedWeldConstraints = {}
@@ -240,14 +242,38 @@ local function CleanupInvisOutline()
         InvisOutlineModel:Destroy()
         InvisOutlineModel = nil
     end
+    InvisOutlineHumanoid = nil
+    InvisOutlineHRP = nil
 end
 
-local function BuildAvatarOutline(char, hrp)
+local function BuildAvatarOutline(char, hrp, hum)
     CleanupInvisOutline()
 
     local outlineModel = Instance.new("Model")
     outlineModel.Name = "MM2_AvatarOutline"
-    outlineModel.Parent = Workspace
+
+    local outlineHRP = Instance.new("Part")
+    outlineHRP.Name = "HumanoidRootPart"
+    outlineHRP.Size = hrp.Size
+    outlineHRP.CFrame = hrp.CFrame
+    outlineHRP.Anchored = true
+    outlineHRP.CanCollide = false
+    outlineHRP.CanTouch = false
+    outlineHRP.CanQuery = false
+    outlineHRP.CastShadow = false
+    outlineHRP.Massless = true
+    outlineHRP.Transparency = 1
+    outlineHRP.Parent = outlineModel
+
+    local outlineHum = Instance.new("Humanoid")
+    outlineHum.Name = "Humanoid"
+    outlineHum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+    outlineHum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+    if hum then
+        outlineHum.RigType = hum.RigType
+        outlineHum.HipHeight = hum.HipHeight
+    end
+    outlineHum.Parent = outlineModel
 
     local highlight = Instance.new("Highlight")
     highlight.Name = "AvatarOutlineHighlight"
@@ -304,7 +330,12 @@ local function BuildAvatarOutline(char, hrp)
         end
     end
 
+    outlineModel.PrimaryPart = outlineHRP
+    outlineModel.Parent = Workspace
+
     InvisOutlineModel = outlineModel
+    InvisOutlineHumanoid = outlineHum
+    InvisOutlineHRP = outlineHRP
 end
 
 local function TrackAndHideCharacterObjects(char, hrp, referenceMapCF)
@@ -396,12 +427,14 @@ local function EnableInvisibility()
     hrp.CanTouch = true
     hrp.CFrame = startMapCFrame
 
-    BuildAvatarOutline(char, hrp)
+    BuildAvatarOutline(char, hrp, hum)
 
-    -- Keep CameraSubject on Humanoid so Roblox's native Shift-Lock (MouseLockController) works
-    if not SpectateConnection then
+    -- Point CameraSubject to the Outline Model's Humanoid in the map:
+    -- 1. Keeps the camera right on your blue outline in the map (never up in the sky)
+    -- 2. Enables Roblox's native Shift-Lock (which requires a Humanoid CameraSubject)
+    if not SpectateConnection and InvisOutlineHumanoid then
         Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
-        Workspace.CurrentCamera.CameraSubject = hum
+        Workspace.CurrentCamera.CameraSubject = InvisOutlineHumanoid
     end
 
     InvisibleRenderLoop = RunService.RenderStepped:Connect(function()
@@ -420,7 +453,7 @@ local function EnableInvisibility()
             hRoot.RotVelocity = Vector3.new(0, 0, 0)
         end
 
-        -- Support Shift-Lock and First-Person character rotation smoothly
+        -- Rotate character & outline smoothly when Shift-Lock or First-Person is active
         if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
             local camLook = Workspace.CurrentCamera.CFrame.LookVector
             local flatLook = Vector3.new(camLook.X, 0, camLook.Z)
@@ -431,17 +464,20 @@ local function EnableInvisibility()
 
         InvisLastMapCFrame = mapCF
 
-        -- Keep CameraSubject on Humanoid so Shift-Lock works natively
-        if not SpectateConnection and Workspace.CurrentCamera.CameraSubject ~= hHum then
-            Workspace.CurrentCamera.CameraSubject = hHum
-        end
-
         -- Catch any newly added weapons (holstered Knife on back, Gun on waist, equipped tools, etc.)
         TrackAndHideCharacterObjects(c, hRoot, mapCF)
 
-        -- Update avatar outline at the player's real map position
-        if not InvisOutlineModel or not InvisOutlineModel.Parent then
-            BuildAvatarOutline(c, hRoot)
+        -- Update avatar outline and its HumanoidRootPart at the player's real map position
+        if not InvisOutlineModel or not InvisOutlineModel.Parent or not InvisOutlineHumanoid then
+            BuildAvatarOutline(c, hRoot, hHum)
+        end
+
+        if InvisOutlineHRP then
+            InvisOutlineHRP.CFrame = mapCF
+        end
+
+        if not SpectateConnection and InvisOutlineHumanoid and Workspace.CurrentCamera.CameraSubject ~= InvisOutlineHumanoid then
+            Workspace.CurrentCamera.CameraSubject = InvisOutlineHumanoid
         end
 
         if InvisOutlineModel then
@@ -455,26 +491,24 @@ local function EnableInvisibility()
             end
         end
 
-        -- Move all actual body parts & holstered weapons far away from spawn while keeping HumanoidRootPart at mapCF
-        local farCF = CFrame.new(mapCF.Position.X, mapCF.Position.Y + 2500, mapCF.Position.Z)
+        -- Move all actual body parts & holstered weapons far away (+2500 studs up) via Root joints
         for _, joint in ipairs(InvisRootJoints) do
             if joint and joint.Parent then
                 local saved = InvisSavedJoints[joint]
                 if saved then
                     if joint.Part0 == hRoot then
-                        joint.C0 = mapCF:ToObjectSpace(farCF) * saved.C1
+                        joint.C0 = saved.C0 + Vector3.new(0, 2500, 0)
                     elseif joint.Part1 == hRoot then
-                        joint.C1 = farCF:ToObjectSpace(mapCF) * saved.C0
+                        joint.C1 = saved.C1 + Vector3.new(0, 2500, 0)
                     end
                 end
             end
         end
 
-        -- Immediately lock HumanoidRootPart at mapCF so joint C0 changes never shift it
+        -- Keep HumanoidRootPart locked at mapCF in the map
         hRoot.CFrame = mapCF
 
-        -- Move any un-jointed or WeldConstraint-detached weapon/accessory parts far away as well
-        for part, data in pairs(InvisSavedParts) do
+        for part in pairs(InvisSavedParts) do
             if part and part.Parent then
                 part.RootPriority = -127
                 part.Massless = true
@@ -482,9 +516,6 @@ local function EnableInvisibility()
                 part.CanTouch = true
                 part.Transparency = 1
                 part.LocalTransparencyModifier = 1
-                if (part.Position - mapCF.Position).Magnitude < 500 then
-                    part.CFrame = farCF * data.RelCF
-                end
             end
         end
     end)
@@ -1040,7 +1071,11 @@ local function StopSpectating()
     local char, hrp, hum = GetCharacter()
     if hum then
         Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
-        Workspace.CurrentCamera.CameraSubject = hum
+        if InvisibilityEnabled and InvisOutlineHumanoid then
+            Workspace.CurrentCamera.CameraSubject = InvisOutlineHumanoid
+        else
+            Workspace.CurrentCamera.CameraSubject = hum
+        end
         Rayfield:Notify({ Title = "Spectate Stopped", Content = "Camera reset to local character.", Duration = 3, Image = "check" })
     end
 end
