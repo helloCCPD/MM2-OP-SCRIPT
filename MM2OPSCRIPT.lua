@@ -1,4 +1,4 @@
--- MM2 Ultimate Script - RENAMED INVISIBILITY TOGGLE
+-- MM2 Ultimate Script - By HelloCCPD
 
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
