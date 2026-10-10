@@ -181,11 +181,37 @@ local InvisibleRenderLoop = nil
 local InvisOutlineModel = nil
 local InvisSavedParts = {}
 local InvisSavedJoints = {}
+local InvisSavedWeldConstraints = {}
 local InvisSavedDecals = {}
+local InvisSavedEffects = {}
 local InvisRootJoints = {}
+local InvisRootJointSet = {}
 local InvisSavedRootPriority = 0
 local InvisSavedHipHeight = nil
 local InvisLastMapCFrame = nil
+
+local ValidAvatarLimbs = {
+    ["Head"] = true,
+    ["Torso"] = true,
+    ["UpperTorso"] = true,
+    ["LowerTorso"] = true,
+    ["Left Arm"] = true,
+    ["Right Arm"] = true,
+    ["Left Leg"] = true,
+    ["Right Leg"] = true,
+    ["LeftUpperArm"] = true,
+    ["LeftLowerArm"] = true,
+    ["LeftHand"] = true,
+    ["RightUpperArm"] = true,
+    ["RightLowerArm"] = true,
+    ["RightHand"] = true,
+    ["LeftUpperLeg"] = true,
+    ["LeftLowerLeg"] = true,
+    ["LeftFoot"] = true,
+    ["RightUpperLeg"] = true,
+    ["RightLowerLeg"] = true,
+    ["RightFoot"] = true
+}
 
 local function MaintainCharacterCollision()
     if NoclipEnabled then return end
@@ -234,7 +260,7 @@ local function BuildAvatarOutline(char, hrp)
     highlight.Parent = outlineModel
 
     for _, part in pairs(char:GetChildren()) do
-        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+        if part:IsA("BasePart") and ValidAvatarLimbs[part.Name] then
             local proxy = Instance.new("Part")
             proxy.Name = part.Name
             proxy.Size = part.Size
@@ -281,6 +307,61 @@ local function BuildAvatarOutline(char, hrp)
     InvisOutlineModel = outlineModel
 end
 
+local function TrackAndHideCharacterObjects(char, hrp, referenceMapCF)
+    for _, obj in pairs(char:GetDescendants()) do
+        if obj:IsA("Motor6D") or obj:IsA("Weld") then
+            if InvisSavedJoints[obj] == nil then
+                InvisSavedJoints[obj] = {
+                    C0 = obj.C0,
+                    C1 = obj.C1,
+                    Part0 = obj.Part0,
+                    Part1 = obj.Part1,
+                    Enabled = obj.Enabled
+                }
+            end
+            if (obj.Part0 == hrp or obj.Part1 == hrp) and not InvisRootJointSet[obj] then
+                InvisRootJointSet[obj] = true
+                table.insert(InvisRootJoints, obj)
+            end
+        elseif obj:IsA("WeldConstraint") then
+            if (obj.Part0 == hrp or obj.Part1 == hrp) then
+                if InvisSavedWeldConstraints[obj] == nil then
+                    InvisSavedWeldConstraints[obj] = obj.Enabled
+                end
+                obj.Enabled = false
+            end
+        elseif obj:IsA("BasePart") and obj ~= hrp then
+            if InvisSavedParts[obj] == nil then
+                InvisSavedParts[obj] = {
+                    RelCF = referenceMapCF:ToObjectSpace(obj.CFrame),
+                    Transparency = obj.Transparency,
+                    LocalTransparencyModifier = obj.LocalTransparencyModifier,
+                    CanCollide = obj.CanCollide,
+                    CanTouch = obj.CanTouch,
+                    Massless = obj.Massless,
+                    RootPriority = obj.RootPriority
+                }
+            end
+            obj.RootPriority = -127
+            obj.Massless = true
+            obj.CanCollide = false
+            obj.CanTouch = true
+            obj.Transparency = 1
+            obj.LocalTransparencyModifier = 1
+        elseif obj:IsA("Decal") or obj:IsA("Texture") then
+            if InvisSavedDecals[obj] == nil then
+                InvisSavedDecals[obj] = obj.Transparency
+            end
+            obj.Transparency = 1
+        elseif obj:IsA("Beam") or obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
+            if InvisSavedEffects[obj] == nil then
+                InvisSavedEffects[obj] = obj.Enabled
+            end
+            obj.Enabled = false
+        end
+    end
+end
+
 local function EnableInvisibility()
     local char, hrp, hum = GetCharacter()
     if not char or not hrp or not hum then return end
@@ -290,8 +371,11 @@ local function EnableInvisibility()
 
     InvisSavedParts = {}
     InvisSavedJoints = {}
+    InvisSavedWeldConstraints = {}
     InvisSavedDecals = {}
+    InvisSavedEffects = {}
     InvisRootJoints = {}
+    InvisRootJointSet = {}
 
     local startMapCFrame = hrp.CFrame
     InvisLastMapCFrame = startMapCFrame
@@ -306,37 +390,7 @@ local function EnableInvisibility()
         hum.HipHeight = 2
     end
 
-    for _, obj in pairs(char:GetDescendants()) do
-        if obj:IsA("Motor6D") or obj:IsA("Weld") then
-            InvisSavedJoints[obj] = {
-                C0 = obj.C0,
-                C1 = obj.C1,
-                Part0 = obj.Part0,
-                Part1 = obj.Part1,
-                Enabled = obj.Enabled
-            }
-            if obj.Part0 == hrp or obj.Part1 == hrp then
-                table.insert(InvisRootJoints, obj)
-            end
-        elseif obj:IsA("BasePart") and obj ~= hrp then
-            InvisSavedParts[obj] = {
-                RelCF = startMapCFrame:ToObjectSpace(obj.CFrame),
-                Transparency = obj.Transparency,
-                CanCollide = obj.CanCollide,
-                CanTouch = obj.CanTouch,
-                Massless = obj.Massless,
-                RootPriority = obj.RootPriority
-            }
-            obj.RootPriority = -127
-            obj.Massless = true
-            obj.CanCollide = false
-            obj.CanTouch = true
-            obj.Transparency = 1
-        elseif obj:IsA("Decal") or obj:IsA("Texture") then
-            InvisSavedDecals[obj] = obj.Transparency
-            obj.Transparency = 1
-        end
-    end
+    TrackAndHideCharacterObjects(char, hrp, startMapCFrame)
 
     hrp.CanCollide = true
     hrp.CanTouch = true
@@ -344,9 +398,10 @@ local function EnableInvisibility()
 
     BuildAvatarOutline(char, hrp)
 
+    -- Keep CameraSubject on Humanoid so Roblox's native Shift-Lock (MouseLockController) works
     if not SpectateConnection then
         Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
-        Workspace.CurrentCamera.CameraSubject = hrp
+        Workspace.CurrentCamera.CameraSubject = hum
     end
 
     InvisibleRenderLoop = RunService.RenderStepped:Connect(function()
@@ -363,14 +418,26 @@ local function EnableInvisibility()
             hRoot.CFrame = mapCF
             hRoot.Velocity = Vector3.new(0, 0, 0)
             hRoot.RotVelocity = Vector3.new(0, 0, 0)
-        else
-            InvisLastMapCFrame = mapCF
         end
 
-        -- Keep camera locked to HumanoidRootPart in the map
-        if not SpectateConnection and Workspace.CurrentCamera.CameraSubject ~= hRoot then
-            Workspace.CurrentCamera.CameraSubject = hRoot
+        -- Support Shift-Lock and First-Person character rotation smoothly
+        if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+            local camLook = Workspace.CurrentCamera.CFrame.LookVector
+            local flatLook = Vector3.new(camLook.X, 0, camLook.Z)
+            if flatLook.Magnitude > 0.001 then
+                mapCF = CFrame.new(mapCF.Position, mapCF.Position + flatLook.Unit)
+            end
         end
+
+        InvisLastMapCFrame = mapCF
+
+        -- Keep CameraSubject on Humanoid so Shift-Lock works natively
+        if not SpectateConnection and Workspace.CurrentCamera.CameraSubject ~= hHum then
+            Workspace.CurrentCamera.CameraSubject = hHum
+        end
+
+        -- Catch any newly added weapons (holstered Knife on back, Gun on waist, equipped tools, etc.)
+        TrackAndHideCharacterObjects(c, hRoot, mapCF)
 
         -- Update avatar outline at the player's real map position
         if not InvisOutlineModel or not InvisOutlineModel.Parent then
@@ -379,7 +446,7 @@ local function EnableInvisibility()
 
         if InvisOutlineModel then
             for part, data in pairs(InvisSavedParts) do
-                if part and part.Parent then
+                if part and part.Parent and ValidAvatarLimbs[part.Name] then
                     local proxy = InvisOutlineModel:FindFirstChild(part.Name)
                     if proxy and proxy:IsA("BasePart") then
                         proxy.CFrame = mapCF * data.RelCF
@@ -388,7 +455,7 @@ local function EnableInvisibility()
             end
         end
 
-        -- Move all actual body parts far away from spawn while keeping HumanoidRootPart anchored at mapCF
+        -- Move all actual body parts & holstered weapons far away from spawn while keeping HumanoidRootPart at mapCF
         local farCF = CFrame.new(mapCF.Position.X, mapCF.Position.Y + 2500, mapCF.Position.Z)
         for _, joint in ipairs(InvisRootJoints) do
             if joint and joint.Parent then
@@ -406,13 +473,18 @@ local function EnableInvisibility()
         -- Immediately lock HumanoidRootPart at mapCF so joint C0 changes never shift it
         hRoot.CFrame = mapCF
 
-        for part in pairs(InvisSavedParts) do
+        -- Move any un-jointed or WeldConstraint-detached weapon/accessory parts far away as well
+        for part, data in pairs(InvisSavedParts) do
             if part and part.Parent then
                 part.RootPriority = -127
                 part.Massless = true
                 part.CanCollide = false
                 part.CanTouch = true
                 part.Transparency = 1
+                part.LocalTransparencyModifier = 1
+                if (part.Position - mapCF.Position).Magnitude < 500 then
+                    part.CFrame = farCF * data.RelCF
+                end
             end
         end
     end)
@@ -440,6 +512,10 @@ local function EnableInvisibility()
         for _, part in pairs(c:GetDescendants()) do
             if part:IsA("BasePart") then
                 part.CanTouch = true
+                if part ~= hRoot then
+                    part.Transparency = 1
+                    part.LocalTransparencyModifier = 1
+                end
             end
         end
 
@@ -483,7 +559,7 @@ local function DisableInvisibility()
             end
         end
 
-        -- Snap all body parts cleanly back to their exact relative position on HumanoidRootPart
+        -- Snap all body parts & holstered weapons cleanly back to their exact relative position on HumanoidRootPart
         for part, data in pairs(InvisSavedParts) do
             if part and part.Parent then
                 part.Velocity = Vector3.new(0, 0, 0)
@@ -491,15 +567,28 @@ local function DisableInvisibility()
                 part.RootPriority = data.RootPriority
                 part.Massless = data.Massless
                 part.Transparency = data.Transparency
+                part.LocalTransparencyModifier = data.LocalTransparencyModifier or 0
                 part.CanCollide = not NoclipEnabled and data.CanCollide or false
                 part.CanTouch = true
                 part.CFrame = restoreCF * data.RelCF
             end
         end
 
+        for wc, enabled in pairs(InvisSavedWeldConstraints) do
+            if wc and wc.Parent then
+                wc.Enabled = enabled
+            end
+        end
+
         for decal, trans in pairs(InvisSavedDecals) do
             if decal and decal.Parent then
                 decal.Transparency = trans
+            end
+        end
+
+        for effect, enabled in pairs(InvisSavedEffects) do
+            if effect and effect.Parent then
+                effect.Enabled = enabled
             end
         end
 
@@ -528,8 +617,11 @@ local function DisableInvisibility()
 
     InvisSavedParts = {}
     InvisSavedJoints = {}
+    InvisSavedWeldConstraints = {}
     InvisSavedDecals = {}
+    InvisSavedEffects = {}
     InvisRootJoints = {}
+    InvisRootJointSet = {}
     InvisLastMapCFrame = nil
 end
 
@@ -948,11 +1040,7 @@ local function StopSpectating()
     local char, hrp, hum = GetCharacter()
     if hum then
         Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
-        if InvisibilityEnabled and hrp then
-            Workspace.CurrentCamera.CameraSubject = hrp
-        else
-            Workspace.CurrentCamera.CameraSubject = hum
-        end
+        Workspace.CurrentCamera.CameraSubject = hum
         Rayfield:Notify({ Title = "Spectate Stopped", Content = "Camera reset to local character.", Duration = 3, Image = "check" })
     end
 end
@@ -1869,8 +1957,11 @@ LocalPlayer.CharacterAdded:Connect(function(char)
     CleanupInvisOutline()
     InvisSavedParts = {}
     InvisSavedJoints = {}
+    InvisSavedWeldConstraints = {}
     InvisSavedDecals = {}
+    InvisSavedEffects = {}
     InvisRootJoints = {}
+    InvisRootJointSet = {}
     InvisLastMapCFrame = nil
 
     task.wait(0.5)
