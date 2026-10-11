@@ -336,15 +336,6 @@ local function BuildAvatarOutline(char, hrp, hum)
                     meshClone.Parent = proxy
                 end
             end
-
-            local selectionBox = Instance.new("SelectionBox")
-            selectionBox.Name = "LimbOutline"
-            selectionBox.Adornee = proxy
-            selectionBox.Color3 = Color3.fromRGB(0, 255, 255)
-            selectionBox.LineThickness = 0.02
-            selectionBox.SurfaceTransparency = 1
-            selectionBox.Transparency = 0
-            selectionBox.Parent = proxy
         end
     end
 
