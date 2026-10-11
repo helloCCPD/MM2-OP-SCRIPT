@@ -179,6 +179,7 @@ end
 local InvisibleConnection = nil
 local InvisibleRenderLoop = nil
 local InvisOutlineModel = nil
+local InvisOutlineLimbs = nil
 local InvisOutlineHumanoid = nil
 local InvisOutlineHRP = nil
 local InvisSavedParts = {}
@@ -242,6 +243,7 @@ local function CleanupInvisOutline()
         InvisOutlineModel:Destroy()
         InvisOutlineModel = nil
     end
+    InvisOutlineLimbs = nil
     InvisOutlineHumanoid = nil
     InvisOutlineHRP = nil
 end
@@ -254,7 +256,7 @@ local function BuildAvatarOutline(char, hrp, hum)
 
     local outlineHRP = Instance.new("Part")
     outlineHRP.Name = "HumanoidRootPart"
-    outlineHRP.Size = hrp.Size
+    outlineHRP.Size = Vector3.new(0.05, 0.05, 0.05)
     outlineHRP.CFrame = hrp.CFrame
     outlineHRP.Anchored = true
     outlineHRP.CanCollide = false
@@ -265,15 +267,27 @@ local function BuildAvatarOutline(char, hrp, hum)
     outlineHRP.Transparency = 1
     outlineHRP.Parent = outlineModel
 
+    local noCollide = Instance.new("NoCollisionConstraint")
+    noCollide.Part0 = outlineHRP
+    noCollide.Part1 = hrp
+    noCollide.Parent = outlineHRP
+
     local outlineHum = Instance.new("Humanoid")
     outlineHum.Name = "Humanoid"
     outlineHum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
     outlineHum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+    outlineHum.EvaluateStateMachine = false
     if hum then
         outlineHum.RigType = hum.RigType
         outlineHum.HipHeight = hum.HipHeight
     end
     outlineHum.Parent = outlineModel
+
+    -- Keep visual limb proxies in a child Model and prefixed with "Outline_" so outlineHum
+    -- never detects them as Head/UpperTorso/LowerTorso/Torso and never forces CanCollide = true on them
+    local limbsContainer = Instance.new("Model")
+    limbsContainer.Name = "OutlineLimbs"
+    limbsContainer.Parent = outlineModel
 
     local highlight = Instance.new("Highlight")
     highlight.Name = "AvatarOutlineHighlight"
@@ -282,13 +296,13 @@ local function BuildAvatarOutline(char, hrp, hum)
     highlight.FillTransparency = 1
     highlight.OutlineTransparency = 0
     highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    highlight.Adornee = outlineModel
-    highlight.Parent = outlineModel
+    highlight.Adornee = limbsContainer
+    highlight.Parent = limbsContainer
 
     for _, part in pairs(char:GetChildren()) do
         if part:IsA("BasePart") and ValidAvatarLimbs[part.Name] then
             local proxy = Instance.new("Part")
-            proxy.Name = part.Name
+            proxy.Name = "Outline_" .. part.Name
             proxy.Size = part.Size
             proxy.CFrame = part.CFrame
             proxy.Anchored = true
@@ -300,7 +314,12 @@ local function BuildAvatarOutline(char, hrp, hum)
             proxy.Material = Enum.Material.SmoothPlastic
             proxy.Color = Color3.fromRGB(0, 255, 255)
             proxy.Transparency = 0.95
-            proxy.Parent = outlineModel
+            proxy.Parent = limbsContainer
+
+            local limbNoCollide = Instance.new("NoCollisionConstraint")
+            limbNoCollide.Part0 = proxy
+            limbNoCollide.Part1 = hrp
+            limbNoCollide.Parent = proxy
 
             if part:IsA("MeshPart") and part.MeshId ~= "" then
                 local specialMesh = Instance.new("SpecialMesh")
@@ -334,6 +353,7 @@ local function BuildAvatarOutline(char, hrp, hum)
     outlineModel.Parent = Workspace
 
     InvisOutlineModel = outlineModel
+    InvisOutlineLimbs = limbsContainer
     InvisOutlineHumanoid = outlineHum
     InvisOutlineHRP = outlineHRP
 end
@@ -477,6 +497,7 @@ local function EnableInvisibility()
         end
 
         if InvisOutlineHRP then
+            InvisOutlineHRP.CanCollide = false
             InvisOutlineHRP.CFrame = mapCF
         end
 
@@ -484,11 +505,12 @@ local function EnableInvisibility()
             Workspace.CurrentCamera.CameraSubject = InvisOutlineHumanoid
         end
 
-        if InvisOutlineModel then
+        if InvisOutlineLimbs then
             for part, data in pairs(InvisSavedParts) do
                 if part and part.Parent and ValidAvatarLimbs[part.Name] then
-                    local proxy = InvisOutlineModel:FindFirstChild(part.Name)
+                    local proxy = InvisOutlineLimbs:FindFirstChild("Outline_" .. part.Name)
                     if proxy and proxy:IsA("BasePart") then
+                        proxy.CanCollide = false
                         proxy.CFrame = mapCF * data.RelCF
                     end
                 end
@@ -536,23 +558,29 @@ local function EnableInvisibility()
 
         hRoot.RootPriority = 127
 
-        -- Neutralize Animator Transform on Root joints and damp spin/upward drift so the 2500-stud offset never spirals
-        for _, joint in ipairs(InvisRootJoints) do
+        -- Ensure no outline part ever has CanCollide enabled during the physics step
+        if InvisOutlineModel then
+            for _, obj in pairs(InvisOutlineModel:GetDescendants()) do
+                if obj:IsA("BasePart") then
+                    obj.CanCollide = false
+                    obj.CanTouch = false
+                    obj.CanQuery = false
+                end
+            end
+        end
+
+        -- Neutralize Animator Transform on all character Motor6Ds so far-away parts never swing or create torque
+        for joint in pairs(InvisSavedJoints) do
             if joint and joint.Parent and joint:IsA("Motor6D") then
                 joint.Transform = CFrame.new()
             end
         end
 
-        if not FlyEnabled then
-            hRoot.RotVelocity = Vector3.new(0, 0, 0)
-            local state = hHum:GetState()
-            if not hHum.Jump and state ~= Enum.HumanoidStateType.Jumping and hRoot.Velocity.Y > 0 then
-                hRoot.Velocity = Vector3.new(hRoot.Velocity.X, 0, hRoot.Velocity.Z)
-            end
-        end
-
         for part in pairs(InvisSavedParts) do
             if part and part.Parent then
+                part.CanCollide = false
+                part.Massless = true
+                part.RootPriority = -127
                 part.Velocity = Vector3.new(0, 0, 0)
                 part.RotVelocity = Vector3.new(0, 0, 0)
             end
@@ -565,7 +593,7 @@ local function EnableInvisibility()
         hHum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
         hHum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
 
-        -- Always keep collision and touch enabled so player can pick up dropped gun while invisible
+        -- Always keep collision and touch enabled on HumanoidRootPart so player can pick up dropped gun while invisible
         if not NoclipEnabled then
             hRoot.CanCollide = true
         end
@@ -575,6 +603,7 @@ local function EnableInvisibility()
             if part:IsA("BasePart") then
                 part.CanTouch = true
                 if part ~= hRoot then
+                    part.CanCollide = false
                     part.Transparency = 1
                     part.LocalTransparencyModifier = 1
                 end
