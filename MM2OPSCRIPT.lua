@@ -146,7 +146,8 @@ end
 local function GetDistance(position)
     local char, hrp = GetCharacter()
     if hrp and position then
-        return math.floor((hrp.Position - position).Magnitude)
+        local refPos = (InvisibilityEnabled and InvisLastMapCFrame) and InvisLastMapCFrame.Position or hrp.Position
+        return math.floor((refPos - position).Magnitude)
     end
     return 0
 end
@@ -169,6 +170,7 @@ local function SafeTeleport(targetCFrame)
         hrp.CFrame = dest
         if InvisibilityEnabled then
             InvisLastMapCFrame = dest
+            InvisLastMapVelocity = Vector3.new(0, 0, 0)
         end
     end)
     
@@ -177,21 +179,18 @@ end
 
 -- ==================== INVISIBILITY ====================
 local InvisibleConnection = nil
-local InvisibleRenderLoop = nil
+local InvisibleHeartbeatLoop = nil
 local InvisOutlineModel = nil
 local InvisOutlineLimbs = nil
 local InvisOutlineHumanoid = nil
 local InvisOutlineHRP = nil
 local InvisSavedParts = {}
-local InvisSavedJoints = {}
-local InvisSavedWeldConstraints = {}
 local InvisSavedDecals = {}
 local InvisSavedEffects = {}
-local InvisRootJoints = {}
-local InvisRootJointSet = {}
-local InvisSavedRootPriority = 0
 local InvisSavedHipHeight = nil
 local InvisLastMapCFrame = nil
+local InvisLastMapVelocity = Vector3.new(0, 0, 0)
+local InvisSkyCFrame = nil
 
 local ValidAvatarLimbs = {
     ["Head"] = true,
@@ -360,41 +359,16 @@ end
 
 local function TrackAndHideCharacterObjects(char, hrp, referenceMapCF)
     for _, obj in pairs(char:GetDescendants()) do
-        if obj:IsA("Motor6D") or obj:IsA("Weld") then
-            if InvisSavedJoints[obj] == nil then
-                InvisSavedJoints[obj] = {
-                    C0 = obj.C0,
-                    C1 = obj.C1,
-                    Part0 = obj.Part0,
-                    Part1 = obj.Part1,
-                    Enabled = obj.Enabled
-                }
-            end
-            if (obj.Part0 == hrp or obj.Part1 == hrp) and not InvisRootJointSet[obj] then
-                InvisRootJointSet[obj] = true
-                table.insert(InvisRootJoints, obj)
-            end
-        elseif obj:IsA("WeldConstraint") then
-            if (obj.Part0 == hrp or obj.Part1 == hrp) then
-                if InvisSavedWeldConstraints[obj] == nil then
-                    InvisSavedWeldConstraints[obj] = obj.Enabled
-                end
-                obj.Enabled = false
-            end
-        elseif obj:IsA("BasePart") and obj ~= hrp then
+        if obj:IsA("BasePart") and obj ~= hrp then
             if InvisSavedParts[obj] == nil then
                 InvisSavedParts[obj] = {
                     RelCF = referenceMapCF:ToObjectSpace(obj.CFrame),
                     Transparency = obj.Transparency,
                     LocalTransparencyModifier = obj.LocalTransparencyModifier,
                     CanCollide = obj.CanCollide,
-                    CanTouch = obj.CanTouch,
-                    Massless = obj.Massless,
-                    RootPriority = obj.RootPriority
+                    CanTouch = obj.CanTouch
                 }
             end
-            obj.RootPriority = -127
-            obj.Massless = true
             obj.CanCollide = false
             obj.CanTouch = true
             obj.Transparency = 1
@@ -418,24 +392,18 @@ local function EnableInvisibility()
     if not char or not hrp or not hum then return end
 
     if InvisibleConnection then InvisibleConnection:Disconnect() InvisibleConnection = nil end
-    if InvisibleRenderLoop then InvisibleRenderLoop:Disconnect() InvisibleRenderLoop = nil end
+    if InvisibleHeartbeatLoop then InvisibleHeartbeatLoop:Disconnect() InvisibleHeartbeatLoop = nil end
+    pcall(function() RunService:UnbindFromRenderStep("MM2_InvisRestore") end)
 
     InvisSavedParts = {}
-    InvisSavedJoints = {}
-    InvisSavedWeldConstraints = {}
     InvisSavedDecals = {}
     InvisSavedEffects = {}
-    InvisRootJoints = {}
-    InvisRootJointSet = {}
 
     local startMapCFrame = hrp.CFrame
     InvisLastMapCFrame = startMapCFrame
-    InvisSavedRootPriority = hrp.RootPriority
+    InvisLastMapVelocity = hrp.Velocity
+    InvisSkyCFrame = nil
     InvisSavedHipHeight = hum.HipHeight
-
-    -- Force HumanoidRootPart to have highest RootPriority (127) so changing Root joint C0
-    -- moves the body parts away from HumanoidRootPart instead of pulling HumanoidRootPart away
-    hrp.RootPriority = 127
 
     if hum.RigType == Enum.HumanoidRigType.R6 and hum.HipHeight == 0 then
         hum.HipHeight = 2
@@ -445,7 +413,6 @@ local function EnableInvisibility()
 
     hrp.CanCollide = true
     hrp.CanTouch = true
-    hrp.CFrame = startMapCFrame
 
     BuildAvatarOutline(char, hrp, hum)
 
@@ -457,106 +424,48 @@ local function EnableInvisibility()
         Workspace.CurrentCamera.CameraSubject = InvisOutlineHumanoid
     end
 
-    InvisibleRenderLoop = RunService.RenderStepped:Connect(function()
+    -- STEP 1 (RenderPriority.First): At the start of every frame (after the server network packet was sent),
+    -- restore HumanoidRootPart back to the map BEFORE Input, Camera, Animator, and Physics Simulation run.
+    RunService:BindToRenderStep("MM2_InvisRestore", Enum.RenderPriority.First.Value, function()
         if not InvisibilityEnabled then return end
         local c, hRoot, hHum = GetCharacter()
         if not c or not hRoot or not hHum then return end
 
-        hRoot.RootPriority = 127
-
-        local mapCF = hRoot.CFrame
-        -- Guard against HumanoidRootPart ever getting pulled toward the far-away body parts
-        if InvisLastMapCFrame and (mapCF.Position.Y > InvisLastMapCFrame.Position.Y + 500 or (mapCF.Position - InvisLastMapCFrame.Position).Magnitude > 1000) then
-            mapCF = InvisLastMapCFrame
-            hRoot.CFrame = mapCF
-            hRoot.Velocity = Vector3.new(0, 0, 0)
-            hRoot.RotVelocity = Vector3.new(0, 0, 0)
+        -- If another script feature (Teleport, AutoFarm, AutoGrabGun) moved hRoot to a map destination, adopt it
+        if InvisSkyCFrame and (hRoot.Position - InvisSkyCFrame.Position).Magnitude > 100 and hRoot.Position.Y < (InvisLastMapCFrame and InvisLastMapCFrame.Position.Y + 2500 or 2500) then
+            InvisLastMapCFrame = hRoot.CFrame
+            InvisLastMapVelocity = hRoot.Velocity
         end
+
+        local mapCF = InvisLastMapCFrame or hRoot.CFrame
 
         -- Rotate character & outline smoothly when Shift-Lock or First-Person is active
         if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter and not FlyEnabled then
             local camLook = Workspace.CurrentCamera.CFrame.LookVector
             local flatLook = Vector3.new(camLook.X, 0, camLook.Z)
             if flatLook.Magnitude > 0.001 then
-                local currentVel = hRoot.Velocity
                 mapCF = CFrame.new(mapCF.Position, mapCF.Position + flatLook.Unit)
-                hRoot.CFrame = mapCF
-                hRoot.Velocity = currentVel
-                hRoot.RotVelocity = Vector3.new(0, 0, 0)
             end
         end
 
         InvisLastMapCFrame = mapCF
-
-        -- Catch any newly added weapons (holstered Knife on back, Gun on waist, equipped tools, etc.)
-        TrackAndHideCharacterObjects(c, hRoot, mapCF)
-
-        -- Update avatar outline and its HumanoidRootPart at the player's real map position
-        if not InvisOutlineModel or not InvisOutlineModel.Parent or not InvisOutlineHumanoid then
-            BuildAvatarOutline(c, hRoot, hHum)
-        end
-
-        if InvisOutlineHRP then
-            InvisOutlineHRP.CanCollide = false
-            InvisOutlineHRP.CFrame = mapCF
-        end
-
-        if not SpectateConnection and InvisOutlineHumanoid and Workspace.CurrentCamera.CameraSubject ~= InvisOutlineHumanoid then
-            Workspace.CurrentCamera.CameraSubject = InvisOutlineHumanoid
-        end
-
-        if InvisOutlineLimbs then
-            for part, data in pairs(InvisSavedParts) do
-                if part and part.Parent and ValidAvatarLimbs[part.Name] then
-                    local proxy = InvisOutlineLimbs:FindFirstChild("Outline_" .. part.Name)
-                    if proxy and proxy:IsA("BasePart") then
-                        proxy.CanCollide = false
-                        proxy.CFrame = mapCF * data.RelCF
-                    end
-                end
-            end
-        end
-
-        -- Only apply the +2500 stud offset to Root joints if not already applied (prevents per-frame physics solver spiral)
-        for _, joint in ipairs(InvisRootJoints) do
-            if joint and joint.Parent then
-                local saved = InvisSavedJoints[joint]
-                if saved then
-                    if joint.Part0 == hRoot then
-                        local targetC0 = saved.C0 + Vector3.new(0, 2500, 0)
-                        if (joint.C0.Position - targetC0.Position).Magnitude > 1 then
-                            joint.C0 = targetC0
-                            hRoot.CFrame = mapCF
-                        end
-                    elseif joint.Part1 == hRoot then
-                        local targetC1 = saved.C1 + Vector3.new(0, 2500, 0)
-                        if (joint.C1.Position - targetC1.Position).Magnitude > 1 then
-                            joint.C1 = targetC1
-                            hRoot.CFrame = mapCF
-                        end
-                    end
-                end
-            end
-        end
-
-        for part in pairs(InvisSavedParts) do
-            if part and part.Parent then
-                part.RootPriority = -127
-                part.Massless = true
-                part.CanCollide = false
-                part.CanTouch = true
-                part.Transparency = 1
-                part.LocalTransparencyModifier = 1
-            end
-        end
+        hRoot.CFrame = mapCF
+        hRoot.Velocity = InvisLastMapVelocity or Vector3.new(0, 0, 0)
+        hRoot.RotVelocity = Vector3.new(0, 0, 0)
     end)
 
+    -- STEP 2 (Stepped / PreSimulation): Right before the Physics step runs, guarantee hRoot is in the map
+    -- with CanCollide & CanTouch enabled so walking, jumping, and picking up the dropped gun work natively.
     InvisibleConnection = RunService.Stepped:Connect(function()
         if not InvisibilityEnabled then return end
         local c, hRoot, hHum = GetCharacter()
         if not c or not hRoot or not hHum then return end
 
-        hRoot.RootPriority = 127
+        if InvisLastMapCFrame and InvisSkyCFrame and (hRoot.Position - InvisSkyCFrame.Position).Magnitude < 100 then
+            hRoot.CFrame = InvisLastMapCFrame
+            hRoot.Velocity = InvisLastMapVelocity or Vector3.new(0, 0, 0)
+            hRoot.RotVelocity = Vector3.new(0, 0, 0)
+        end
 
         -- Ensure no outline part ever has CanCollide enabled during the physics step
         if InvisOutlineModel then
@@ -566,23 +475,6 @@ local function EnableInvisibility()
                     obj.CanTouch = false
                     obj.CanQuery = false
                 end
-            end
-        end
-
-        -- Neutralize Animator Transform on all character Motor6Ds so far-away parts never swing or create torque
-        for joint in pairs(InvisSavedJoints) do
-            if joint and joint.Parent and joint:IsA("Motor6D") then
-                joint.Transform = CFrame.new()
-            end
-        end
-
-        for part in pairs(InvisSavedParts) do
-            if part and part.Parent then
-                part.CanCollide = false
-                part.Massless = true
-                part.RootPriority = -127
-                part.Velocity = Vector3.new(0, 0, 0)
-                part.RotVelocity = Vector3.new(0, 0, 0)
             end
         end
 
@@ -624,11 +516,69 @@ local function EnableInvisibility()
             end
         end
     end)
+
+    -- STEP 3 (Heartbeat / PostSimulation): Runs immediately AFTER Physics Simulation and right BEFORE
+    -- Roblox's Network Replicator sends your character CFrame to the server!
+    -- Captures your real map movement for the outline, then sends your real character 5,000 studs into the sky
+    -- so the server and all other players cannot see or hit your character in the map.
+    InvisibleHeartbeatLoop = RunService.Heartbeat:Connect(function()
+        if not InvisibilityEnabled then return end
+        local c, hRoot, hHum = GetCharacter()
+        if not c or not hRoot or not hHum then return end
+
+        local mapCF = hRoot.CFrame
+        if InvisSkyCFrame and (mapCF.Position - InvisSkyCFrame.Position).Magnitude < 100 then
+            mapCF = InvisLastMapCFrame or mapCF
+        else
+            InvisLastMapCFrame = mapCF
+            InvisLastMapVelocity = hRoot.Velocity
+        end
+
+        -- Catch any newly added weapons (holstered Knife on back, Gun on waist, equipped tools, etc.)
+        TrackAndHideCharacterObjects(c, hRoot, mapCF)
+
+        -- Update avatar outline and its HumanoidRootPart at the player's real map position
+        if not InvisOutlineModel or not InvisOutlineModel.Parent or not InvisOutlineHumanoid then
+            BuildAvatarOutline(c, hRoot, hHum)
+        end
+
+        if InvisOutlineHRP then
+            InvisOutlineHRP.CanCollide = false
+            InvisOutlineHRP.CFrame = mapCF
+        end
+
+        if not SpectateConnection and InvisOutlineHumanoid and Workspace.CurrentCamera.CameraSubject ~= InvisOutlineHumanoid then
+            Workspace.CurrentCamera.CameraSubject = InvisOutlineHumanoid
+        end
+
+        if InvisOutlineLimbs then
+            for part, data in pairs(InvisSavedParts) do
+                if part and part.Parent and ValidAvatarLimbs[part.Name] then
+                    local proxy = InvisOutlineLimbs:FindFirstChild("Outline_" .. part.Name)
+                    if proxy and proxy:IsA("BasePart") then
+                        proxy.CanCollide = false
+                        if (part.Position - mapCF.Position).Magnitude < 50 then
+                            proxy.CFrame = part.CFrame
+                        else
+                            proxy.CFrame = mapCF * data.RelCF
+                        end
+                    end
+                end
+            end
+        end
+
+        -- Spoof real character assembly far away into the sky for server network replication
+        InvisSkyCFrame = CFrame.new(mapCF.Position.X, mapCF.Position.Y + 5000, mapCF.Position.Z) * (mapCF - mapCF.Position)
+        hRoot.CFrame = InvisSkyCFrame
+        hRoot.Velocity = Vector3.new(0, 0, 0)
+        hRoot.RotVelocity = Vector3.new(0, 0, 0)
+    end)
 end
 
 local function DisableInvisibility()
     if InvisibleConnection then InvisibleConnection:Disconnect() InvisibleConnection = nil end
-    if InvisibleRenderLoop then InvisibleRenderLoop:Disconnect() InvisibleRenderLoop = nil end
+    if InvisibleHeartbeatLoop then InvisibleHeartbeatLoop:Disconnect() InvisibleHeartbeatLoop = nil end
+    pcall(function() RunService:UnbindFromRenderStep("MM2_InvisRestore") end)
 
     CleanupInvisOutline()
 
@@ -639,35 +589,15 @@ local function DisableInvisibility()
         hrp.RotVelocity = Vector3.new(0, 0, 0)
         hrp.CFrame = restoreCF
 
-        -- Restore all joints to exact original C0/C1 before snapping parts back
-        for joint, data in pairs(InvisSavedJoints) do
-            if joint and joint.Parent then
-                joint.Part0 = data.Part0
-                joint.Part1 = data.Part1
-                joint.C0 = data.C0
-                joint.C1 = data.C1
-                joint.Enabled = data.Enabled
-            end
-        end
-
-        -- Snap all body parts & holstered weapons cleanly back to their exact relative position on HumanoidRootPart
+        -- Restore all body parts & holstered weapons cleanly back to their normal visibility and collision
         for part, data in pairs(InvisSavedParts) do
             if part and part.Parent then
                 part.Velocity = Vector3.new(0, 0, 0)
                 part.RotVelocity = Vector3.new(0, 0, 0)
-                part.RootPriority = data.RootPriority
-                part.Massless = data.Massless
                 part.Transparency = data.Transparency
                 part.LocalTransparencyModifier = data.LocalTransparencyModifier or 0
                 part.CanCollide = not NoclipEnabled and data.CanCollide or false
                 part.CanTouch = true
-                part.CFrame = restoreCF * data.RelCF
-            end
-        end
-
-        for wc, enabled in pairs(InvisSavedWeldConstraints) do
-            if wc and wc.Parent then
-                wc.Enabled = enabled
             end
         end
 
@@ -683,7 +613,6 @@ local function DisableInvisibility()
             end
         end
 
-        hrp.RootPriority = InvisSavedRootPriority
         hrp.CanCollide = not NoclipEnabled
         hrp.CanTouch = true
         hrp.CFrame = restoreCF
@@ -707,13 +636,11 @@ local function DisableInvisibility()
     end
 
     InvisSavedParts = {}
-    InvisSavedJoints = {}
-    InvisSavedWeldConstraints = {}
     InvisSavedDecals = {}
     InvisSavedEffects = {}
-    InvisRootJoints = {}
-    InvisRootJointSet = {}
     InvisLastMapCFrame = nil
+    InvisLastMapVelocity = Vector3.new(0, 0, 0)
+    InvisSkyCFrame = nil
 end
 
 -- ==================== MAP & LOBBY DETECTION ====================
@@ -830,6 +757,9 @@ local function StartAutoGrabGun()
             local char, hrp = GetCharacter()
             if hrp then
                 hrp.CFrame = gun.CFrame
+                if InvisibilityEnabled then
+                    InvisLastMapCFrame = gun.CFrame
+                end
             end
         end
     end)
@@ -958,6 +888,7 @@ RunService.Heartbeat:Connect(function()
     if not KillAuraEnabled then return end
     local char, hrp = GetCharacter()
     if not char or not hrp then return end
+    local myPos = (InvisibilityEnabled and InvisLastMapCFrame) and InvisLastMapCFrame.Position or hrp.Position
     
     for _, player in pairs(Players:GetPlayers()) do
         if player ~= LocalPlayer and player.Character then
@@ -965,7 +896,7 @@ RunService.Heartbeat:Connect(function()
             local targetHum = player.Character:FindFirstChild("Humanoid")
             
             if targetHrp and targetHum and targetHum.Health > 0 then
-                local dist = (hrp.Position - targetHrp.Position).Magnitude
+                local dist = (myPos - targetHrp.Position).Magnitude
                 if dist <= KillAuraRange then
                     TriggerKnifeAttack(player.Character)
                 end
@@ -991,6 +922,7 @@ local function GetAimbotTarget()
     UpdateRoles()
     local _, hrp = GetCharacter()
     if not hrp then return nil end
+    local myPos = (InvisibilityEnabled and InvisLastMapCFrame) and InvisLastMapCFrame.Position or hrp.Position
 
     local candidates = {}
     if AimbotTargetMode == "Murderer" then
@@ -1010,7 +942,7 @@ local function GetAimbotTarget()
             local th = plr.Character:FindFirstChild("HumanoidRootPart")
             local hh = plr.Character:FindFirstChild("Humanoid")
             if th and hh and hh.Health > 0 then
-                local d = (th.Position - hrp.Position).Magnitude
+                local d = (th.Position - myPos).Magnitude
                 if d <= bestDist then
                     best, bestDist = plr, d
                 end
@@ -1023,6 +955,7 @@ end
 local function GetAimPosition()
     local _, hrp = GetCharacter()
     if not hrp then return nil end
+    local myPos = (InvisibilityEnabled and InvisLastMapCFrame) and InvisLastMapCFrame.Position or hrp.Position
     local target = GetAimbotTarget()
     if not target or not target.Character then return nil end
     local th = target.Character:FindFirstChild("HumanoidRootPart")
@@ -1030,7 +963,7 @@ local function GetAimPosition()
     if not th or not hh or hh.Health <= 0 then return nil end
 
     local bulletSpeed = 250
-    local timeToHit = (th.Position - hrp.Position).Magnitude / bulletSpeed
+    local timeToHit = (th.Position - myPos).Magnitude / bulletSpeed
     return th.Position + (th.Velocity * timeToHit)
 end
 
@@ -1043,7 +976,13 @@ local function AimbotAim()
     if AimbotLockCamera then
         Workspace.CurrentCamera.CFrame = CFrame.new(Workspace.CurrentCamera.CFrame.Position, aimPos)
     end
-    hrp.CFrame = CFrame.new(hrp.Position, Vector3.new(aimPos.X, hrp.Position.Y, aimPos.Z))
+    if InvisibilityEnabled and InvisLastMapCFrame then
+        local pos = InvisLastMapCFrame.Position
+        InvisLastMapCFrame = CFrame.new(pos, Vector3.new(aimPos.X, pos.Y, aimPos.Z))
+        hrp.CFrame = InvisLastMapCFrame
+    else
+        hrp.CFrame = CFrame.new(hrp.Position, Vector3.new(aimPos.X, hrp.Position.Y, aimPos.Z))
+    end
     return aimPos
 end
 
@@ -1467,10 +1406,14 @@ local function AutoCollect()
     while AutoCollectEnabled do
         local char, hrp = GetCharacter()
         if hrp then
+            local myPos = (InvisibilityEnabled and InvisLastMapCFrame) and InvisLastMapCFrame.Position or hrp.Position
             for _, coin in pairs(GetCoins()) do
                 if coin and coin.Parent then
-                    if (hrp.Position - coin.Position).Magnitude < 15 then
+                    if (myPos - coin.Position).Magnitude < 15 then
                         hrp.CFrame = coin.CFrame
+                        if InvisibilityEnabled then
+                            InvisLastMapCFrame = coin.CFrame
+                        end
                     end
                 end
             end
@@ -2050,14 +1993,13 @@ MiscTab:CreateButton({
 -- Character handler
 LocalPlayer.CharacterAdded:Connect(function(char)
     CleanupInvisOutline()
+    pcall(function() RunService:UnbindFromRenderStep("MM2_InvisRestore") end)
     InvisSavedParts = {}
-    InvisSavedJoints = {}
-    InvisSavedWeldConstraints = {}
     InvisSavedDecals = {}
     InvisSavedEffects = {}
-    InvisRootJoints = {}
-    InvisRootJointSet = {}
     InvisLastMapCFrame = nil
+    InvisLastMapVelocity = Vector3.new(0, 0, 0)
+    InvisSkyCFrame = nil
 
     task.wait(0.5)
     local hrp = char:WaitForChild("HumanoidRootPart")
