@@ -1,4 +1,5 @@
 -- MM2 Ultimate Script - By HelloCCPD
+-- Updated: Fling system rebuilt + expanded (methods, fling-all/nearest, loop, click-fling, touch-fling, anti-fling, force-stop, boost)
 
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
@@ -30,6 +31,28 @@ local XRayEnabled = false
 -- Combat Variables
 local KillAuraEnabled = false
 local KillAuraRange = 1000
+
+-- ==================== FLING VARIABLES (NEW) ====================
+local FlingMethod = "Spin"          -- Spin | Velocity | CFrame | BodyVelocity | Network
+local FlingPower = 100000           -- velocity magnitude used by the fling
+local FlingDuration = 1.5           -- how long a single fling lasts (seconds)
+local FlingOffsetY = -1             -- how far inside the target we sink before flinging
+local FlingLoopEnabled = false
+local FlingLoopTargetName = "All Players"
+local FlingLoopThread = nil
+local FlingLoopInterval = 0.5       -- per-target fling time while looping
+local ClickFlingEnabled = false
+local ClickFlingTool = nil
+local ClickFlingConnection = nil
+local ClickFlingHighlights = {}
+local TouchFlingEnabled = false
+local TouchFlingConnection = nil
+local AntiFlingEnabled = false
+local AntiFlingConnection = nil
+local AntiFlingThreshold = 300
+local CharacterBoostEnabled = false
+local IsFlinging = false
+-- =============================================================
 
 -- Aimbot Variables
 local AimbotEnabled = false
@@ -794,59 +817,360 @@ local function TriggerKnifeAttack(targetChar)
     end
 end
 
-local function FlingTargetModel(targetPlayer)
-    if not targetPlayer or not targetPlayer.Character or not targetPlayer.Character:FindFirstChild("HumanoidRootPart") then
-        return false
+-- ---------------------------------------------------------------
+-- FLING CORE (FIXED + METHOD BASED)
+-- Methods: Spin (default), Velocity, CFrame, BodyVelocity, Network
+-- ---------------------------------------------------------------
+local function GetOtherPlayersList()
+    local list = {}
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+            table.insert(list, plr)
+        end
     end
+    return list
+end
+
+local function RestoreFlingCollision(char)
+    if not char then return end
+    for _, part in pairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if NoclipEnabled then
+                part.CanCollide = false
+            else
+                part.CanCollide = (part.Name == "HumanoidRootPart" or part.Name == "Torso" or part.Name == "UpperTorso" or part.Name == "LowerTorso" or part.Name == "Head")
+            end
+        end
+    end
+end
+
+local function FlingTargetModel(targetPlayer, methodOverride, powerOverride, durationOverride)
+    -- Guard against overlapping flings (loop / touch / manual)
+    if IsFlinging then return false end
+
+    local method = methodOverride or FlingMethod
+    local power = powerOverride or FlingPower
+    local duration = durationOverride or FlingDuration
+
+    if not targetPlayer or not targetPlayer.Character then return false end
+    local tHrp = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not tHrp then return false end
 
     local char, hrp, hum = GetCharacter()
     if not char or not hrp or not hum then return false end
 
-    local targetHrp = targetPlayer.Character.HumanoidRootPart
-    local oldCFrame = hrp.CFrame
-
-    local knife = char:FindFirstChild("Knife") or LocalPlayer.Backpack:FindFirstChild("Knife")
+    -- Equip knife if we have one so the fling secures the kill
+    local knife = char:FindFirstChild("Knife") or (LocalPlayer.Backpack and LocalPlayer.Backpack:FindFirstChild("Knife"))
     if knife and knife.Parent == LocalPlayer.Backpack then
         knife.Parent = char
     end
 
-    local noclipLoop = RunService.Stepped:Connect(function()
-        for _, part in pairs(char:GetDescendants()) do
-            if part:IsA("BasePart") then
-                part.CanCollide = false
+    IsFlinging = true
+
+    local startCFrame = hrp.CFrame
+    local savedCollide = {}
+    for _, part in pairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            savedCollide[part] = part.CanCollide
+            part.CanCollide = false
+        end
+    end
+
+    local startTime = tick()
+    local hbConn
+
+    local function step()
+        if not hrp or not hrp.Parent or not tHrp or not tHrp.Parent then return end
+        local tCF = tHrp.CFrame
+        if method == "Velocity" then
+            hrp.CFrame = tCF * CFrame.new(0, FlingOffsetY, 0)
+            hrp.Velocity = Vector3.new(power, power, power)
+            hrp.RotVelocity = Vector3.new(power, power, power)
+        elseif method == "CFrame" then
+            hrp.CFrame = tCF * CFrame.new(0, FlingOffsetY, 0) * CFrame.Angles(0, math.rad(math.random(0, 360)), 0)
+            hrp.Velocity = Vector3.new(0, 0, 0)
+            hrp.RotVelocity = Vector3.new(0, power, 0)
+        elseif method == "Network" then
+            hrp.CFrame = tCF
+            hrp.Velocity = Vector3.new(0, 0, 0)
+            hrp.RotVelocity = Vector3.new(0, power * 10, 0)
+        else -- "Spin" (default / fallback)
+            hrp.CFrame = tCF * CFrame.new(0, FlingOffsetY, 0) * CFrame.Angles(math.rad(math.random(0, 360)), math.rad(math.random(0, 360)), math.rad(math.random(0, 360)))
+            hrp.RotVelocity = Vector3.new(0, power, 0)
+            hrp.Velocity = Vector3.new(power, power, power)
+        end
+        if InvisibilityEnabled then
+            InvisLastMapCFrame = tCF
+            InvisLastMapVelocity = Vector3.new(0, 0, 0)
+        end
+    end
+
+    if method == "BodyVelocity" then
+        hrp.CFrame = tHrp.CFrame * CFrame.new(0, FlingOffsetY, 0)
+        if InvisibilityEnabled then
+            InvisLastMapCFrame = tHrp.CFrame
+            InvisLastMapVelocity = Vector3.new(0, 0, 0)
+        end
+        local bv = Instance.new("BodyVelocity")
+        bv.Name = "FlingBodyVelocity"
+        bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+        bv.Velocity = Vector3.new(power, power, power)
+        bv.Parent = hrp
+        local bav = Instance.new("BodyAngularVelocity")
+        bav.Name = "FlingBodyAngularVelocity"
+        bav.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+        bav.AngularVelocity = Vector3.new(0, power, 0)
+        bav.Parent = hrp
+        task.wait(duration)
+        pcall(function() bv:Destroy() end)
+        pcall(function() bav:Destroy() end)
+    else
+        hbConn = RunService.Heartbeat:Connect(function()
+            if (tick() - startTime > duration) then return end
+            step()
+        end)
+        task.wait(duration)
+        if hbConn then hbConn:Disconnect() end
+    end
+
+    -- Reset & restore
+    if hrp and hrp.Parent then
+        hrp.Velocity = Vector3.new(0, 0, 0)
+        hrp.RotVelocity = Vector3.new(0, 0, 0)
+        hrp.CFrame = startCFrame
+        if InvisibilityEnabled then
+            InvisLastMapCFrame = startCFrame
+            InvisLastMapVelocity = Vector3.new(0, 0, 0)
+        end
+    end
+
+    for part, canCol in pairs(savedCollide) do
+        if part and part.Parent then
+            part.CanCollide = NoclipEnabled and false or canCol
+        end
+    end
+
+    IsFlinging = false
+    return true
+end
+
+-- ---------------------------------------------------------------
+-- NEW FLING FEATURES
+-- ---------------------------------------------------------------
+
+local function FlingAllPlayers()
+    local list = GetOtherPlayersList()
+    if #list == 0 then
+        Rayfield:Notify({ Title = "Fling All", Content = "No players to fling!", Duration = 3, Image = "x" })
+        return
+    end
+    task.spawn(function()
+        for _, plr in pairs(list) do
+            if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+                FlingTargetModel(plr, FlingMethod, FlingPower, FlingDuration)
             end
         end
     end)
-
-    local flingLoop
-    local startTime = tick()
-
-    flingLoop = RunService.Heartbeat:Connect(function()
-        if not targetHrp or not targetHrp.Parent or not hrp or not hrp.Parent or (tick() - startTime > 1.8) then
-            if flingLoop then flingLoop:Disconnect() end
-            return
-        end
-
-        if knife then
-            knife:Activate()
-        end
-
-        hrp.CFrame = targetHrp.CFrame * CFrame.new(0, -1, 0) * CFrame.Angles(math.rad(math.random(0,360)), math.rad(math.random(0,360)), math.rad(math.random(0,360)))
-        hrp.RotVelocity = Vector3.new(0, 100000, 0)
-        hrp.Velocity = Vector3.new(100000, 100000, 100000)
-    end)
-
-    task.wait(1.8)
-
-    if flingLoop then flingLoop:Disconnect() end
-    if noclipLoop then noclipLoop:Disconnect() end
-
-    hrp.RotVelocity = Vector3.new(0, 0, 0)
-    hrp.Velocity = Vector3.new(0, 0, 0)
-    hrp.CFrame = oldCFrame
-
-    return true
+    Rayfield:Notify({ Title = "Fling All", Content = "Flinging " .. #list .. " player(s)!", Duration = 3, Image = "skull" })
 end
+
+local function FlingNearestPlayer()
+    local char, hrp = GetCharacter()
+    if not hrp then return end
+    local myPos = (InvisibilityEnabled and InvisLastMapCFrame) and InvisLastMapCFrame.Position or hrp.Position
+    local best, bestDist = nil, math.huge
+    for _, plr in pairs(GetOtherPlayersList()) do
+        local tHrp = plr.Character.HumanoidRootPart
+        local d = (tHrp.Position - myPos).Magnitude
+        if d < bestDist then best, bestDist = plr, d end
+    end
+    if best then
+        task.spawn(function() FlingTargetModel(best) end)
+        Rayfield:Notify({ Title = "Fling", Content = "Flung nearest: " .. best.Name .. " (" .. math.floor(bestDist) .. "m)", Duration = 3, Image = "skull" })
+    else
+        Rayfield:Notify({ Title = "Fling", Content = "No players found!", Duration = 3, Image = "x" })
+    end
+end
+
+local function StartFlingLoop()
+    if FlingLoopThread then
+        pcall(function() task.cancel(FlingLoopThread) end)
+        FlingLoopThread = nil
+    end
+    FlingLoopThread = task.spawn(function()
+        while FlingLoopEnabled do
+            if FlingLoopTargetName ~= "" and FlingLoopTargetName ~= "All Players" then
+                local t = Players:FindFirstChild(FlingLoopTargetName)
+                if t and t.Character and t.Character:FindFirstChild("HumanoidRootPart") then
+                    FlingTargetModel(t, FlingMethod, FlingPower, FlingLoopInterval)
+                end
+            else
+                for _, plr in pairs(GetOtherPlayersList()) do
+                    if not FlingLoopEnabled then break end
+                    FlingTargetModel(plr, FlingMethod, FlingPower, FlingLoopInterval)
+                end
+            end
+            task.wait(0.05)
+        end
+    end)
+end
+
+local function StopFlingLoop()
+    FlingLoopEnabled = false
+    if FlingLoopThread then
+        pcall(function() task.cancel(FlingLoopThread) end)
+        FlingLoopThread = nil
+    end
+end
+
+local function ForceStopFling()
+    StopFlingLoop()
+    IsFlinging = false
+
+    local char, hrp = GetCharacter()
+    if hrp then
+        -- remove any leftover fling movers
+        for _, m in pairs(hrp:GetChildren()) do
+            if m:IsA("BodyVelocity") and m.Name == "FlingBodyVelocity" then m:Destroy() end
+            if m:IsA("BodyAngularVelocity") and m.Name == "FlingBodyAngularVelocity" then m:Destroy() end
+        end
+        hrp.Velocity = Vector3.new(0, 0, 0)
+        hrp.RotVelocity = Vector3.new(0, 0, 0)
+        if InvisibilityEnabled and InvisLastMapCFrame then
+            hrp.CFrame = InvisLastMapCFrame
+        end
+    end
+    RestoreFlingCollision(char)
+    Rayfield:Notify({ Title = "Fling", Content = "Force stopped fling & reset character!", Duration = 3, Image = "check" })
+end
+
+-- Click Fling Tool (interactive tool + player highlighting)
+local function ClearClickFlingHighlights()
+    for _, hl in pairs(ClickFlingHighlights) do
+        if hl and hl.Parent then hl:Destroy() end
+    end
+    ClickFlingHighlights = {}
+end
+
+local function StartClickFling()
+    if ClickFlingConnection then ClickFlingConnection:Disconnect() ClickFlingConnection = nil end
+    ClearClickFlingHighlights()
+
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    local tool = char:FindFirstChild("MM2_FlingTool")
+    if not tool then
+        tool = Instance.new("Tool")
+        tool.Name = "MM2_FlingTool"
+        tool.RequiresHandle = false
+        tool.CanBeDropped = false
+        tool.Parent = char
+    end
+    ClickFlingTool = tool
+
+    -- Highlight every other player while the tool is active
+    for _, plr in pairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character then
+            local hl = Instance.new("Highlight")
+            hl.Name = "MM2_ClickFlingHL"
+            hl.FillColor = Color3.fromRGB(255, 80, 80)
+            hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+            hl.FillTransparency = 0.6
+            hl.OutlineTransparency = 0
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Adornee = plr.Character
+            hl.Parent = plr.Character
+            ClickFlingHighlights[plr] = hl
+        end
+    end
+
+    ClickFlingConnection = tool.Activated:Connect(function()
+        local mouse = LocalPlayer:GetMouse()
+        local unitRay = Workspace.CurrentCamera:ScreenPointToRay(mouse.X, mouse.Y)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { char }
+        local result = Workspace:Raycast(unitRay.Origin, unitRay.Direction * 2000, params)
+
+        local targetPlr = nil
+        if result and result.Instance then
+            local model = result.Instance:FindFirstAncestorOfClass("Model")
+            targetPlr = model and Players:GetPlayerFromCharacter(model)
+        end
+
+        if targetPlr and targetPlr ~= LocalPlayer then
+            task.spawn(function() FlingTargetModel(targetPlr) end)
+        else
+            Rayfield:Notify({ Title = "Click Fling", Content = "No player under cursor!", Duration = 2, Image = "x" })
+        end
+    end)
+end
+
+local function StopClickFling()
+    if ClickFlingConnection then ClickFlingConnection:Disconnect() ClickFlingConnection = nil end
+    ClearClickFlingHighlights()
+    local char = LocalPlayer.Character
+    if char then
+        local tool = char:FindFirstChild("MM2_FlingTool") or (LocalPlayer.Backpack and LocalPlayer.Backpack:FindFirstChild("MM2_FlingTool"))
+        if tool then tool:Destroy() end
+    end
+    ClickFlingTool = nil
+end
+
+-- Touch fling (walk/fling into players automatically)
+local function StartTouchFling()
+    if TouchFlingConnection then TouchFlingConnection:Disconnect() end
+    TouchFlingConnection = RunService.Heartbeat:Connect(function()
+        if not TouchFlingEnabled then return end
+        if IsFlinging then return end
+        local char, hrp = GetCharacter()
+        if not hrp then return end
+        local myPos = (InvisibilityEnabled and InvisLastMapCFrame) and InvisLastMapCFrame.Position or hrp.Position
+        for _, plr in pairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and plr.Character then
+                local tHrp = plr.Character:FindFirstChild("HumanoidRootPart")
+                local tHum = plr.Character:FindFirstChild("Humanoid")
+                if tHrp and tHum and tHum.Health > 0 and (myPos - tHrp.Position).Magnitude <= 5 then
+                    task.spawn(function() FlingTargetModel(plr, FlingMethod, FlingPower, math.min(FlingDuration, 0.5)) end)
+                end
+            end
+        end
+    end)
+end
+
+-- Anti-Fling (protect yourself from being flung)
+local function StartAntiFling()
+    if AntiFlingConnection then AntiFlingConnection:Disconnect() end
+    AntiFlingConnection = RunService.Heartbeat:Connect(function()
+        if not AntiFlingEnabled then return end
+        if FlyEnabled or IsFlinging then return end
+        local char, hrp = GetCharacter()
+        if not hrp then return end
+        local vel = hrp.AssemblyLinearVelocity or hrp.Velocity
+        if vel.Magnitude > AntiFlingThreshold then
+            hrp.Velocity = Vector3.new(0, 0, 0)
+            hrp.RotVelocity = Vector3.new(0, 0, 0)
+        end
+    end)
+end
+
+-- Character boost (higher density = stronger flings, harder to be flung)
+local function SetCharacterBoost(enabled)
+    local char = LocalPlayer.Character
+    if not char then return end
+    for _, part in pairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if enabled then
+                part.CustomPhysicalProperties = PhysicalProperties.new(2, 0.7, 0.5, 1, 100)
+            else
+                part.CustomPhysicalProperties = nil
+            end
+        end
+    end
+end
+
+-- ---------------------------------------------------------------
 
 local function KillMurdererAnywhere()
     UpdateRoles()
@@ -1697,6 +2021,169 @@ CombatTab:CreateButton({
     end,
 })
 
+-- ==================== NEW FLING UI ====================
+CombatTab:CreateDropdown({
+    Name = "Fling Method",
+    Options = {"Spin", "Velocity", "CFrame", "BodyVelocity", "Network"},
+    CurrentOption = "Spin",
+    Flag = "FlingMethodDropdown",
+    Callback = function(Option)
+        if typeof(Option) == "table" then
+            FlingMethod = Option[1] or "Spin"
+        else
+            FlingMethod = Option or "Spin"
+        end
+    end,
+})
+
+CombatTab:CreateSlider({
+    Name = "Fling Power",
+    Range = {1000, 1000000},
+    Increment = 1000,
+    Suffix = "",
+    CurrentValue = 100000,
+    Flag = "FlingPowerSlider",
+    Callback = function(Value) FlingPower = Value end,
+})
+
+CombatTab:CreateSlider({
+    Name = "Fling Duration",
+    Range = {0.2, 5},
+    Increment = 0.1,
+    Suffix = "s",
+    CurrentValue = 1.5,
+    Flag = "FlingDurationSlider",
+    Callback = function(Value) FlingDuration = Value end,
+})
+
+CombatTab:CreateButton({
+    Name = "Fling All Players",
+    Callback = function()
+        FlingAllPlayers()
+    end,
+})
+
+CombatTab:CreateButton({
+    Name = "Fling Nearest Player",
+    Callback = function()
+        FlingNearestPlayer()
+    end,
+})
+
+local FlingTargetDropdown = CombatTab:CreateDropdown({
+    Name = "Loop Fling Target",
+    Options = {"All Players"},
+    CurrentOption = "All Players",
+    Flag = "FlingLoopTargetDropdown",
+    Callback = function(Option)
+        if typeof(Option) == "table" then
+            FlingLoopTargetName = Option[1] or "All Players"
+        else
+            FlingLoopTargetName = Option or "All Players"
+        end
+    end,
+})
+
+task.spawn(function()
+    while task.wait(2.5) do
+        local names = {"All Players"}
+        for _, p in pairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer then table.insert(names, p.Name) end
+        end
+        pcall(function() FlingTargetDropdown:Refresh(names) end)
+    end
+end)
+
+CombatTab:CreateToggle({
+    Name = "Loop Fling (continuous)",
+    CurrentValue = false,
+    Flag = "FlingLoopToggle",
+    Callback = function(Value)
+        FlingLoopEnabled = Value
+        if Value then
+            StartFlingLoop()
+            Rayfield:Notify({ Title = "Loop Fling", Content = "Loop flinging: " .. FlingLoopTargetName, Duration = 3, Image = "refresh" })
+        else
+            StopFlingLoop()
+        end
+    end,
+})
+
+CombatTab:CreateToggle({
+    Name = "Click Fling Tool (equip & click players)",
+    CurrentValue = false,
+    Flag = "ClickFlingToggle",
+    Callback = function(Value)
+        ClickFlingEnabled = Value
+        if Value then
+            StartClickFling()
+            Rayfield:Notify({ Title = "Click Fling", Content = "Tool equipped! Click a player to fling them.", Duration = 4, Image = "mouse-pointer" })
+        else
+            StopClickFling()
+        end
+    end,
+})
+
+CombatTab:CreateToggle({
+    Name = "Touch Fling (auto fling on contact)",
+    CurrentValue = false,
+    Flag = "TouchFlingToggle",
+    Callback = function(Value)
+        TouchFlingEnabled = Value
+        if Value then
+            StartTouchFling()
+            Rayfield:Notify({ Title = "Touch Fling", Content = "Walk into players to fling them!", Duration = 3, Image = "move" })
+        elseif TouchFlingConnection then
+            TouchFlingConnection:Disconnect()
+            TouchFlingConnection = nil
+        end
+    end,
+})
+
+CombatTab:CreateToggle({
+    Name = "Anti-Fling (protect me)",
+    CurrentValue = false,
+    Flag = "AntiFlingToggle",
+    Callback = function(Value)
+        AntiFlingEnabled = Value
+        if Value then
+            StartAntiFling()
+            Rayfield:Notify({ Title = "Anti-Fling", Content = "Anti-Fling protection active!", Duration = 3, Image = "shield" })
+        elseif AntiFlingConnection then
+            AntiFlingConnection:Disconnect()
+            AntiFlingConnection = nil
+        end
+    end,
+})
+
+CombatTab:CreateSlider({
+    Name = "Anti-Fling Threshold",
+    Range = {100, 2000},
+    Increment = 50,
+    Suffix = "",
+    CurrentValue = 300,
+    Flag = "AntiFlingThresholdSlider",
+    Callback = function(Value) AntiFlingThreshold = Value end,
+})
+
+CombatTab:CreateToggle({
+    Name = "Character Boost (density)",
+    CurrentValue = false,
+    Flag = "CharacterBoostToggle",
+    Callback = function(Value)
+        CharacterBoostEnabled = Value
+        SetCharacterBoost(Value)
+    end,
+})
+
+CombatTab:CreateButton({
+    Name = "Force Stop Fling",
+    Callback = function()
+        ForceStopFling()
+    end,
+})
+-- =======================================================
+
 CombatTab:CreateToggle({
     Name = "Knife Kill Aura",
     CurrentValue = false,
@@ -1991,6 +2478,7 @@ LocalPlayer.CharacterAdded:Connect(function(char)
     InvisLastMapCFrame = nil
     InvisLastMapVelocity = Vector3.new(0, 0, 0)
     InvisSkyCFrame = nil
+    IsFlinging = false
 
     task.wait(0.5)
     local hrp = char:WaitForChild("HumanoidRootPart")
@@ -2001,6 +2489,9 @@ LocalPlayer.CharacterAdded:Connect(function(char)
     if InvisibilityEnabled then EnableInvisibility() end
     if FlyEnabled then task.wait(0.5) StartFly() end
     if AutoGrabGunEnabled then StartAutoGrabGun() end
+    if CharacterBoostEnabled then task.wait(0.1) SetCharacterBoost(true) end
+    if ClickFlingEnabled then task.wait(0.1) StartClickFling() end
+    if FlingLoopEnabled then task.wait(0.1) StartFlingLoop() end
 end)
 
 -- Role loop
