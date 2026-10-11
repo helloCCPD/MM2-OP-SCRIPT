@@ -1,5 +1,5 @@
 -- MM2 Ultimate Script - By HelloCCPD
--- Updated: Fling system rebuilt + expanded (methods, fling-all/nearest, loop, click-fling, touch-fling, anti-fling, force-stop, boost)
+-- Updated: Fling core replaced with proven SkidFling method + expanded fling features
 
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
@@ -32,15 +32,15 @@ local XRayEnabled = false
 local KillAuraEnabled = false
 local KillAuraRange = 1000
 
--- ==================== FLING VARIABLES (NEW) ====================
-local FlingMethod = "Spin"          -- Spin | Velocity | CFrame | BodyVelocity | Network
-local FlingPower = 100000           -- velocity magnitude used by the fling
-local FlingDuration = 1.5           -- how long a single fling lasts (seconds)
-local FlingOffsetY = -1             -- how far inside the target we sink before flinging
+-- ==================== FLING VARIABLES ====================
+local FlingMethod = "Classic"       -- Classic (SkidFling) | Spin | Velocity | CFrame | BodyVelocity | Network
+local FlingPower = 100000           -- only used by the non-Classic fallback methods
+local FlingDuration = 2             -- how long a single fling lasts (seconds)
+local FlingOffsetY = -1             -- sink depth for fallback methods
 local FlingLoopEnabled = false
 local FlingLoopTargetName = "All Players"
 local FlingLoopThread = nil
-local FlingLoopInterval = 0.5       -- per-target fling time while looping
+local FlingLoopInterval = 0.6
 local ClickFlingEnabled = false
 local ClickFlingTool = nil
 local ClickFlingConnection = nil
@@ -52,7 +52,8 @@ local AntiFlingConnection = nil
 local AntiFlingThreshold = 300
 local CharacterBoostEnabled = false
 local IsFlinging = false
--- =============================================================
+local FallenPartsHeightSaved = nil
+-- ========================================================
 
 -- Aimbot Variables
 local AimbotEnabled = false
@@ -581,11 +582,19 @@ local function EnableInvisibility()
             end
         end
 
-        -- Spoof real character assembly far away into the sky for server network replication
-        InvisSkyCFrame = CFrame.new(mapCF.Position.X, mapCF.Position.Y + 5000, mapCF.Position.Z) * (mapCF - mapCF.Position)
-        hRoot.CFrame = InvisSkyCFrame
-        hRoot.Velocity = Vector3.new(0, 0, 0)
-        hRoot.RotVelocity = Vector3.new(0, 0, 0)
+        -- Spoof real character assembly far away into the sky for server network replication.
+        -- While a fling is running we keep the real body down at the map position so the fling connects.
+        if IsFlinging then
+            InvisSkyCFrame = nil
+            hRoot.CFrame = mapCF
+            hRoot.Velocity = Vector3.new(0, 0, 0)
+            hRoot.RotVelocity = Vector3.new(0, 0, 0)
+        else
+            InvisSkyCFrame = CFrame.new(mapCF.Position.X, mapCF.Position.Y + 5000, mapCF.Position.Z) * (mapCF - mapCF.Position)
+            hRoot.CFrame = InvisSkyCFrame
+            hRoot.Velocity = Vector3.new(0, 0, 0)
+            hRoot.RotVelocity = Vector3.new(0, 0, 0)
+        end
     end)
 end
 
@@ -818,9 +827,11 @@ local function TriggerKnifeAttack(targetChar)
 end
 
 -- ---------------------------------------------------------------
--- FLING CORE (FIXED + METHOD BASED)
--- Methods: Spin (default), Velocity, CFrame, BodyVelocity, Network
+-- FLING CORE
+-- Primary method = "Classic" (SkidFling from zqyDSUWX / K1LAS1K)
+-- Fallback methods: Spin, Velocity, CFrame, BodyVelocity, Network
 -- ---------------------------------------------------------------
+
 local function GetOtherPlayersList()
     local list = {}
     for _, plr in pairs(Players:GetPlayers()) do
@@ -844,28 +855,144 @@ local function RestoreFlingCollision(char)
     end
 end
 
-local function FlingTargetModel(targetPlayer, methodOverride, powerOverride, durationOverride)
-    -- Guard against overlapping flings (loop / touch / manual)
-    if IsFlinging then return false end
-
-    local method = methodOverride or FlingMethod
-    local power = powerOverride or FlingPower
-    local duration = durationOverride or FlingDuration
-
-    if not targetPlayer or not targetPlayer.Character then return false end
-    local tHrp = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
-    if not tHrp then return false end
-
+-- === CLASSIC SKIDFLING (the fix) ===
+local function SkidFling(targetPlayer, duration)
     local char, hrp, hum = GetCharacter()
     if not char or not hrp or not hum then return false end
 
-    -- Equip knife if we have one so the fling secures the kill
+    local TCharacter = targetPlayer.Character
+    if not TCharacter then return false end
+
+    local THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
+    local TRootPart = THumanoid and THumanoid.RootPart
+    local THead = TCharacter:FindFirstChild("Head")
+    local Accessory = TCharacter:FindFirstChildOfClass("Accessory")
+    local Handle = Accessory and Accessory:FindFirstChild("Handle")
+
+    local BasePart = TRootPart or THead or Handle
+    if not BasePart then return false end
+
+    if THumanoid and THumanoid.Sit then
+        Rayfield:Notify({ Title = "Fling", Content = targetPlayer.Name .. " is sitting!", Duration = 2, Image = "x" })
+    end
+
+    if FallenPartsHeightSaved == nil then
+        FallenPartsHeightSaved = Workspace.FallenPartsDestroyHeight
+    end
+
+    -- Equip knife so the fling actually kills
     local knife = char:FindFirstChild("Knife") or (LocalPlayer.Backpack and LocalPlayer.Backpack:FindFirstChild("Knife"))
     if knife and knife.Parent == LocalPlayer.Backpack then
         knife.Parent = char
     end
 
-    IsFlinging = true
+    local oldPos
+    if hrp.Velocity.Magnitude < 50 then
+        oldPos = hrp.CFrame
+    end
+
+    -- Look at the target during the fling (unless invis/spectate controls the camera)
+    if not InvisibilityEnabled and not SpectateConnection then
+        if THead then
+            Workspace.CurrentCamera.CameraSubject = THead
+        elseif Handle then
+            Workspace.CurrentCamera.CameraSubject = Handle
+        elseif THumanoid then
+            Workspace.CurrentCamera.CameraSubject = THumanoid
+        end
+    end
+
+    local function FPos(bp, pos, ang)
+        local cf = CFrame.new(bp.Position) * pos * ang
+        hrp.CFrame = cf
+        char:SetPrimaryPartCFrame(cf)
+        hrp.Velocity = Vector3.new(9e7, 9e7 * 10, 9e7)
+        hrp.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+        if InvisibilityEnabled then
+            InvisLastMapCFrame = cf
+            InvisLastMapVelocity = Vector3.new(0, 0, 0)
+        end
+    end
+
+    Workspace.FallenPartsDestroyHeight = 0 / 0
+
+    local BV = Instance.new("BodyVelocity")
+    BV.Name = "FlingBV"
+    BV.Parent = hrp
+    BV.Velocity = Vector3.new(0, 0, 0)
+    BV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+
+    hum:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+
+    local TimeToWait = duration or FlingDuration
+    local t = tick()
+    local Angle = 0
+    repeat
+        if hrp and hrp.Parent and THumanoid then
+            if BasePart.Velocity.Magnitude < 50 then
+                Angle = Angle + 100
+                local mv = THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25
+                FPos(BasePart, CFrame.new(0, 1.5, 0) + mv, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, -1.5, 0) + mv, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, 1.5, 0) + mv, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, -1.5, 0) + mv, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0)) task.wait()
+            else
+                FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, -1.5, -THumanoid.WalkSpeed), CFrame.Angles(0, 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0)) task.wait()
+                FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0)) task.wait()
+            end
+        end
+    until (t + TimeToWait < tick()) or (not IsFlinging)
+
+    BV:Destroy()
+    hum:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+
+    -- Restore camera
+    if not SpectateConnection then
+        if InvisibilityEnabled and InvisOutlineHumanoid then
+            Workspace.CurrentCamera.CameraSubject = InvisOutlineHumanoid
+        else
+            Workspace.CurrentCamera.CameraSubject = hum
+        end
+    end
+
+    -- Reset character back to where it was
+    if oldPos then
+        local resetStart = tick()
+        repeat
+            hrp.CFrame = oldPos * CFrame.new(0, .5, 0)
+            char:SetPrimaryPartCFrame(oldPos * CFrame.new(0, .5, 0))
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            for _, part in pairs(char:GetChildren()) do
+                if part:IsA("BasePart") then
+                    part.Velocity, part.RotVelocity = Vector3.new(), Vector3.new()
+                end
+            end
+            if InvisibilityEnabled then
+                InvisLastMapCFrame = oldPos * CFrame.new(0, .5, 0)
+                InvisLastMapVelocity = Vector3.new(0, 0, 0)
+            end
+            task.wait()
+        until (hrp.Position - oldPos.Position).Magnitude < 25 or (tick() - resetStart > 2)
+        Workspace.FallenPartsDestroyHeight = FallenPartsHeightSaved
+    end
+
+    return true
+end
+
+-- === FALLBACK METHODS ===
+local function SimpleFling(targetPlayer, method, power, duration)
+    local tHrp = targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not tHrp then return false end
+
+    local char, hrp, hum = GetCharacter()
+    if not char or not hrp or not hum then return false end
 
     local startCFrame = hrp.CFrame
     local savedCollide = {}
@@ -894,7 +1021,7 @@ local function FlingTargetModel(targetPlayer, methodOverride, powerOverride, dur
             hrp.CFrame = tCF
             hrp.Velocity = Vector3.new(0, 0, 0)
             hrp.RotVelocity = Vector3.new(0, power * 10, 0)
-        else -- "Spin" (default / fallback)
+        else -- "Spin"
             hrp.CFrame = tCF * CFrame.new(0, FlingOffsetY, 0) * CFrame.Angles(math.rad(math.random(0, 360)), math.rad(math.random(0, 360)), math.rad(math.random(0, 360)))
             hrp.RotVelocity = Vector3.new(0, power, 0)
             hrp.Velocity = Vector3.new(power, power, power)
@@ -933,7 +1060,6 @@ local function FlingTargetModel(targetPlayer, methodOverride, powerOverride, dur
         if hbConn then hbConn:Disconnect() end
     end
 
-    -- Reset & restore
     if hrp and hrp.Parent then
         hrp.Velocity = Vector3.new(0, 0, 0)
         hrp.RotVelocity = Vector3.new(0, 0, 0)
@@ -950,8 +1076,28 @@ local function FlingTargetModel(targetPlayer, methodOverride, powerOverride, dur
         end
     end
 
-    IsFlinging = false
     return true
+end
+
+-- === DISPATCHER ===
+local function FlingTargetModel(targetPlayer, methodOverride, powerOverride, durationOverride)
+    if IsFlinging then return false end
+
+    local method = methodOverride or FlingMethod
+    local power = powerOverride or FlingPower
+    local duration = durationOverride or FlingDuration
+
+    if not targetPlayer or not targetPlayer.Character then return false end
+
+    IsFlinging = true
+    local ok
+    if method == "Classic" then
+        ok = SkidFling(targetPlayer, duration)
+    else
+        ok = SimpleFling(targetPlayer, method, power, duration)
+    end
+    IsFlinging = false
+    return ok
 end
 
 -- ---------------------------------------------------------------
@@ -1029,9 +1175,8 @@ local function ForceStopFling()
 
     local char, hrp = GetCharacter()
     if hrp then
-        -- remove any leftover fling movers
         for _, m in pairs(hrp:GetChildren()) do
-            if m:IsA("BodyVelocity") and m.Name == "FlingBodyVelocity" then m:Destroy() end
+            if (m:IsA("BodyVelocity") and m.Name == "FlingBodyVelocity") or (m:IsA("BodyVelocity") and m.Name == "FlingBV") then m:Destroy() end
             if m:IsA("BodyAngularVelocity") and m.Name == "FlingBodyAngularVelocity" then m:Destroy() end
         end
         hrp.Velocity = Vector3.new(0, 0, 0)
@@ -1041,6 +1186,9 @@ local function ForceStopFling()
         end
     end
     RestoreFlingCollision(char)
+    if FallenPartsHeightSaved then
+        Workspace.FallenPartsDestroyHeight = FallenPartsHeightSaved
+    end
     Rayfield:Notify({ Title = "Fling", Content = "Force stopped fling & reset character!", Duration = 3, Image = "check" })
 end
 
@@ -1069,7 +1217,6 @@ local function StartClickFling()
     end
     ClickFlingTool = tool
 
-    -- Highlight every other player while the tool is active
     for _, plr in pairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and plr.Character then
             local hl = Instance.new("Highlight")
@@ -1118,7 +1265,7 @@ local function StopClickFling()
     ClickFlingTool = nil
 end
 
--- Touch fling (walk/fling into players automatically)
+-- Touch fling (auto fling on contact)
 local function StartTouchFling()
     if TouchFlingConnection then TouchFlingConnection:Disconnect() end
     TouchFlingConnection = RunService.Heartbeat:Connect(function()
@@ -1132,14 +1279,14 @@ local function StartTouchFling()
                 local tHrp = plr.Character:FindFirstChild("HumanoidRootPart")
                 local tHum = plr.Character:FindFirstChild("Humanoid")
                 if tHrp and tHum and tHum.Health > 0 and (myPos - tHrp.Position).Magnitude <= 5 then
-                    task.spawn(function() FlingTargetModel(plr, FlingMethod, FlingPower, math.min(FlingDuration, 0.5)) end)
+                    task.spawn(function() FlingTargetModel(plr, FlingMethod, FlingPower, math.min(FlingDuration, 1)) end)
                 end
             end
         end
     end)
 end
 
--- Anti-Fling (protect yourself from being flung)
+-- Anti-Fling (protect yourself)
 local function StartAntiFling()
     if AntiFlingConnection then AntiFlingConnection:Disconnect() end
     AntiFlingConnection = RunService.Heartbeat:Connect(function()
@@ -1155,7 +1302,7 @@ local function StartAntiFling()
     end)
 end
 
--- Character boost (higher density = stronger flings, harder to be flung)
+-- Character boost (higher density = stronger flings)
 local function SetCharacterBoost(enabled)
     local char = LocalPlayer.Character
     if not char then return end
@@ -2021,39 +2168,39 @@ CombatTab:CreateButton({
     end,
 })
 
--- ==================== NEW FLING UI ====================
+-- ==================== FLING UI ====================
 CombatTab:CreateDropdown({
     Name = "Fling Method",
-    Options = {"Spin", "Velocity", "CFrame", "BodyVelocity", "Network"},
-    CurrentOption = "Spin",
+    Options = {"Classic", "Spin", "Velocity", "CFrame", "BodyVelocity", "Network"},
+    CurrentOption = "Classic",
     Flag = "FlingMethodDropdown",
     Callback = function(Option)
         if typeof(Option) == "table" then
-            FlingMethod = Option[1] or "Spin"
+            FlingMethod = Option[1] or "Classic"
         else
-            FlingMethod = Option or "Spin"
+            FlingMethod = Option or "Classic"
         end
     end,
 })
 
 CombatTab:CreateSlider({
-    Name = "Fling Power",
+    Name = "Fling Duration",
+    Range = {0.5, 5},
+    Increment = 0.1,
+    Suffix = "s",
+    CurrentValue = 2,
+    Flag = "FlingDurationSlider",
+    Callback = function(Value) FlingDuration = Value end,
+})
+
+CombatTab:CreateSlider({
+    Name = "Fling Power (non-Classic methods)",
     Range = {1000, 1000000},
     Increment = 1000,
     Suffix = "",
     CurrentValue = 100000,
     Flag = "FlingPowerSlider",
     Callback = function(Value) FlingPower = Value end,
-})
-
-CombatTab:CreateSlider({
-    Name = "Fling Duration",
-    Range = {0.2, 5},
-    Increment = 0.1,
-    Suffix = "s",
-    CurrentValue = 1.5,
-    Flag = "FlingDurationSlider",
-    Callback = function(Value) FlingDuration = Value end,
 })
 
 CombatTab:CreateButton({
